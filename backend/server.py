@@ -161,7 +161,10 @@ def main():
     print("=" * 50)
     print("Bolus Designer 后端")
     print("=" * 50)
-    serve(app, host="127.0.0.1", port=8765, threads=8)
+    if os.environ.get("BOLUS_PROD"):
+        serve(app, host="127.0.0.1", port=8765, threads=8)
+    else:
+        app.run(host="127.0.0.1", port=8765, debug=True, use_reloader=True)
 
 
 if __name__ == "__main__":
