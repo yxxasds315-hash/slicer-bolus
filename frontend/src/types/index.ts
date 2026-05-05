@@ -9,6 +9,8 @@ export interface PipelineConfig {
   design_method: 'offset_subtract' | 'hollow';
   roi_mode: 'full_skin' | 'slicer_roi';
   roi_segment_id: string;
+  seal_kernel_1_mm: number;
+  seal_kernel_2_mm: number;
 }
 
 export interface LogEntry {

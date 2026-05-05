@@ -396,6 +396,67 @@ def execute_solidify(config):
     return [{"node": seg_node.GetID(), "name": seg_node.GetName(), "skin_segment": skin_id}]
 
 
+def execute_seal(config):
+    """二次封口: 在实心化后的 Skin 段上执行两次 MORPHOLOGICAL_CLOSING，消除鼻孔与外耳道残余空气."""
+    import slicer
+
+    d = config
+    k1 = d.get("seal_kernel_1_mm", 15.0)  # 耳道大核
+    k2 = d.get("seal_kernel_2_mm", 8.0)   # 鼻孔中核
+
+    to_log("info", f"========== 二次封口: 大核{k1}mm / 中核{k2}mm ==========")
+
+    seg_node = slicer.mrmlScene.GetFirstNodeByName("BolusSegmentation")
+    if not seg_node:
+        raise RuntimeError("未找到 BolusSegmentation 节点, 请先运行预览")
+    seg = seg_node.GetSegmentation()
+    skin_id = seg.GetSegmentIdBySegmentName("Skin")
+    if not skin_id:
+        raise RuntimeError("未找到 Skin 段")
+
+    vol = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")[0]
+
+    editorNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentEditorNode")
+    editorNode.SetOverwriteMode(slicer.vtkMRMLSegmentEditorNode.OverwriteNone)
+    editorNode.SetSelectedSegmentID(skin_id)
+
+    editorWidget = slicer.qMRMLSegmentEditorWidget()
+    editorWidget.setMRMLScene(slicer.mrmlScene)
+    editorWidget.setMRMLSegmentEditorNode(editorNode)
+    editorWidget.setSegmentationNode(seg_node)
+    editorWidget.setSourceVolumeNode(vol)
+
+    def apply_effect(name, params: dict):
+        editorWidget.setActiveEffectByName(name)
+        eff = editorWidget.activeEffect()
+        for k, v in params.items():
+            eff.setParameter(k, v)
+        eff.self().onApply()
+
+    # 第一次：大核封耳道（管道纵深长，需要更大核）
+    to_log("info", f"[1/2] 大核封耳道 — MORPHOLOGICAL_CLOSING {k1}mm")
+    apply_effect("Smoothing", {
+        "SmoothingMethod": "MORPHOLOGICAL_CLOSING",
+        "KernelSizeMm": str(k1),
+    })
+
+    # 第二次：中核补鼻孔（避免过大核破坏鼻尖轮廓）
+    to_log("info", f"[2/2] 中核补鼻孔 — MORPHOLOGICAL_CLOSING {k2}mm")
+    apply_effect("Smoothing", {
+        "SmoothingMethod": "MORPHOLOGICAL_CLOSING",
+        "KernelSizeMm": str(k2),
+    })
+
+    editorWidget.setActiveEffectByName("")
+    editorWidget.setMRMLScene(None)
+    slicer.mrmlScene.RemoveNode(editorNode)
+
+    seg_node.CreateClosedSurfaceRepresentation()
+    to_log("success", f"二次封口完成 — 大核{k1}mm + 中核{k2}mm, 请在 Slicer 中检查鼻孔/耳道")
+
+    return [{"node": seg_node.GetID(), "name": seg_node.GetName(), "skin_segment": skin_id}]
+
+
 def execute_create_roi(config):
     import slicer
 
@@ -491,6 +552,8 @@ def tick():
                 pending_job = lambda c=cfg: execute_activate_scissors(c["config"])
             elif action == "solidify":
                 pending_job = lambda c=cfg: execute_solidify(c["config"])
+            elif action == "seal":
+                pending_job = lambda c=cfg: execute_seal(c["config"])
             elif action == "finalize_preview":
                 pending_job = lambda c=cfg: execute_finalize_preview(c["config"])
             elif action == "create_roi":

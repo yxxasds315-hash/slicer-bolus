@@ -15,6 +15,8 @@ const defaultConfig: PipelineConfig = {
   smoothing_method: 'MEDIAN', smoothing_kernel_mm: 3.0,
   design_method: 'offset_subtract',
   roi_mode: 'full_skin', roi_segment_id: '',
+  seal_kernel_1_mm: 15.0,
+  seal_kernel_2_mm: 8.0,
 };
 
 type ConnStatus = 'checking' | 'online' | 'offline' | 'launching';
@@ -67,6 +69,7 @@ export default function App() {
   const handlePreview = async () => { setPreviewStatus('running'); setPreviewError(''); try { const r = await fetch('/api/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '预览失败'); } setPreviewStatus('threshold_done'); } catch (err: any) { setPreviewStatus('error'); setPreviewError(err.message); } };
   const handleScissors = async () => { setPreviewStatus('scissors_active'); try { await fetch('/api/scissors/activate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); } catch { } };
   const handleSolidify = async () => { setPreviewStatus('running'); setPreviewError(''); try { const r = await fetch('/api/solidify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '实心化失败'); } setPreviewStatus('solidified'); } catch (err: any) { setPreviewStatus('error'); setPreviewError(err.message); } };
+  const handleSeal = async () => { setPreviewStatus('running'); setPreviewError(''); try { const r = await fetch('/api/seal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '二次封口失败'); } setPreviewStatus('sealed'); } catch (err: any) { setPreviewStatus('error'); setPreviewError(err.message); } };
   const handleFinalize = async () => { setPreviewStatus('running'); setPreviewError(''); try { const r = await fetch('/api/preview/finalize', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '后处理失败'); } setPreviewStatus('done'); } catch (err: any) { setPreviewStatus('error'); setPreviewError(err.message); } };
 
   const handleNext = () => { if (step === 6) { executePipeline(); return; } setStep((s) => Math.min(s + 1, 6)); };
@@ -77,7 +80,7 @@ export default function App() {
   const renderStep = () => {
     switch (step) {
       case 1: return <DicomSelector config={config} onChange={updateConfig} slicer={slicer} />;
-      case 2: return <SegmentationPanel config={config} onChange={updateConfig} onPreview={handlePreview} onScissors={handleScissors} onSolidify={handleSolidify} onFinalize={handleFinalize} previewStatus={previewStatus} previewError={previewError} />;
+      case 2: return <SegmentationPanel config={config} onChange={updateConfig} onPreview={handlePreview} onScissors={handleScissors} onSolidify={handleSolidify} onSeal={handleSeal} onFinalize={handleFinalize} previewStatus={previewStatus} previewError={previewError} />;
       case 3: return <RoiSelector config={config} onChange={updateConfig} slicer={slicer} />;
       case 4: return <BolusDesigner config={config} onChange={updateConfig} />;
       case 5: return <ExportSettings config={config} onChange={updateConfig} />;
