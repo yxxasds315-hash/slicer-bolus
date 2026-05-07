@@ -15,7 +15,7 @@ const defaultConfig: PipelineConfig = {
   dicom_dir: '', output_dir: '',
   thickness_mm: 5.0, hu_threshold: -200, oversampling: 3.0,
   smoothing_method: 'MEDIAN', smoothing_kernel_mm: 3.0,
-  design_method: 'offset_subtract',
+  design_method: 'hollow',
   roi_mode: 'full_skin', roi_segment_id: '',
   seal_kernel_1_mm: 15.0,
   seal_kernel_2_mm: 8.0,

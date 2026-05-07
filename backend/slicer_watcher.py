@@ -97,8 +97,9 @@ def execute_pipeline(config):
         raise RuntimeError(f"未找到 {SEG['skin']} 段, 请重新运行预览步骤")
     to_log("info", f"  校验通过: {SEG['skin']} 段存在")
 
-    # Step 3: 补偿器设计 (COPY → Hollow 壳体 → Intersect 裁切)
-    to_log("info", f"[3/5] 补偿器设计 (thickness={d['thickness_mm']}mm)...")
+    # Step 3: 补偿器设计
+    design_method = d.get("design_method", "hollow")
+    to_log("info", f"[3/5] 补偿器设计 (thickness={d['thickness_mm']}mm, method={design_method})...")
 
     BOLUS_THICKNESS = d["thickness_mm"]
     bolus_name = _bolus_name(BOLUS_THICKNESS)
@@ -157,22 +158,39 @@ def execute_pipeline(config):
     editorNode.SetSelectedSegmentID(bolus_id)
 
     try:
-        # 1. COPY skin → bolus（创建独立的补偿器段）
-        effect = _safe_get_effect(editorWidget, "Logical operators")
-        effect.setParameter("Operation", "COPY")
-        effect.setParameter("ModifierSegmentID", skin_id)
-        effect.self().onApply()
-        to_log("info", "  COPY skin → bolus")
+        if design_method == "hollow":
+            # Hollow 抽壳法：COPY skin → Hollow 效果（均匀厚度壳体）
+            effect = _safe_get_effect(editorWidget, "Logical operators")
+            effect.setParameter("Operation", "COPY")
+            effect.setParameter("ModifierSegmentID", skin_id)
+            effect.self().onApply()
+            to_log("info", "  COPY skin → bolus")
 
-        # 2. Hollow 效果：从表面向外生成均匀厚度壳体
-        #    替代 Margin+Subtract 两步法，避免凹面薄壁/孔洞
-        effect = _safe_get_effect(editorWidget, "Hollow")
-        effect.setParameter("ShellMode", "OUTSIDE_SURFACE")
-        effect.setParameter("ShellThicknessMm", str(BOLUS_THICKNESS))
-        effect.self().onApply()
-        to_log("info", f"  Hollow OUTSIDE_SURFACE {BOLUS_THICKNESS}mm")
+            effect = _safe_get_effect(editorWidget, "Hollow")
+            effect.setParameter("ShellMode", "OUTSIDE_SURFACE")
+            effect.setParameter("ShellThicknessMm", str(BOLUS_THICKNESS))
+            effect.self().onApply()
+            to_log("info", f"  Hollow OUTSIDE_SURFACE {BOLUS_THICKNESS}mm")
+        else:
+            # 偏移与相减法：COPY skin → Margin 膨胀 → SUBTRACT skin
+            effect = _safe_get_effect(editorWidget, "Logical operators")
+            effect.setParameter("Operation", "COPY")
+            effect.setParameter("ModifierSegmentID", skin_id)
+            effect.self().onApply()
+            to_log("info", "  COPY skin → bolus")
 
-        # 3. 裁切到 ROI/皮肤边界
+            effect = _safe_get_effect(editorWidget, "Margin")
+            effect.setParameter("MarginSizeMm", str(BOLUS_THICKNESS))
+            effect.self().onApply()
+            to_log("info", f"  Margin +{BOLUS_THICKNESS}mm")
+
+            effect = _safe_get_effect(editorWidget, "Logical operators")
+            effect.setParameter("Operation", "SUBTRACT")
+            effect.setParameter("ModifierSegmentID", skin_id)
+            effect.self().onApply()
+            to_log("info", "  SUBTRACT skin (掏空)")
+
+        # 裁切到 ROI/皮肤边界（两种方法共用）
         effect = _safe_get_effect(editorWidget, "Logical operators")
         effect.setParameter("Operation", "INTERSECT")
         effect.setParameter("ModifierSegmentID", cutter_id)
