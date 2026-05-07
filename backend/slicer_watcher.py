@@ -827,8 +827,16 @@ def execute_mold(config):
 
     female = _make_female_mold(seg_node, bolus_name, SEG["skin"], shell_mm)
     male = _make_male_mold(seg_node, bolus_name, SEG["skin"], skin_pad_mm, base_mm)
-    female, male = _add_pins(female, male, pin_r, pin_h, pin_clr)
-    female = _add_sprue_and_vents(female, sprue_r, vent_r)
+    if d.get("mold_with_pins", True):
+        female, male = _add_pins(female, male, pin_r, pin_h, pin_clr)
+        to_log("info", f"  对准销: r={pin_r}mm x4")
+    else:
+        to_log("info", "  跳过对准销")
+    if d.get("mold_with_sprue", True):
+        female = _add_sprue_and_vents(female, sprue_r, vent_r)
+        to_log("info", f"  注料口: r={sprue_r}mm / 排气孔: r={vent_r}mm x2")
+    else:
+        to_log("info", "  跳过注料口 & 排气孔")
 
     _add_model_to_scene(female, "Mold_Female_Conformal", color=(0.87, 0.49, 0.33), opacity=0.75)
     _add_model_to_scene(male, "Mold_Male_Base", color=(0.36, 0.55, 0.93), opacity=0.75)

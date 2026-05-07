@@ -25,8 +25,10 @@ const defaultConfig: PipelineConfig = {
   mold_pin_radius_mm: 2.0,
   mold_pin_height_mm: 8.0,
   mold_pin_clearance_mm: 0.20,
+  mold_with_pins: true,
   mold_sprue_radius_mm: 3.0,
   mold_vent_radius_mm: 1.0,
+  mold_with_sprue: true,
 };
 
 type ConnStatus = 'checking' | 'online' | 'offline' | 'no_watcher' | 'launching';

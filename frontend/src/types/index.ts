@@ -17,8 +17,10 @@ export interface PipelineConfig {
   mold_pin_radius_mm: number;
   mold_pin_height_mm: number;
   mold_pin_clearance_mm: number;
+  mold_with_pins: boolean;
   mold_sprue_radius_mm: number;
   mold_vent_radius_mm: number;
+  mold_with_sprue: boolean;
 }
 
 export type MoldStatus = 'idle' | 'running' | 'completed' | 'error';
