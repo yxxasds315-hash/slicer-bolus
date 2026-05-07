@@ -2,7 +2,7 @@
 Bolus Designer — Flask 后端 (独立进程, 不依赖 Slicer 进程的 socket)
 通过文件与 Slicer 通信
 """
-import json, os, time, threading, queue, uuid
+import json, logging, os, time, threading, queue, uuid
 from datetime import datetime
 
 FILES = {
@@ -23,6 +23,8 @@ except ImportError:
 app = Flask(__name__)
 _sse_queues: list[queue.Queue] = []
 _log_history: list[str] = []
+_dispatch_lock = threading.Lock()
+logging.basicConfig(level=logging.WARNING, format='[%(levelname)s] %(message)s')
 
 
 def _broadcast(entry: str):
@@ -40,7 +42,11 @@ def _read_json(path):
     try:
         with open(path) as f:
             return json.load(f)
-    except: return {}
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as e:
+        logging.warning("JSON 解析失败 %s: %s", path, e)
+        return {}
 
 
 def _write_json(path, data):
@@ -65,34 +71,37 @@ def slicer_status():
 
 
 def _dispatch_slicer(config, action, log_msg):
-    """写 config → 轮询 result → 返回"""
+    """写 config → 轮询 result → 返回（线程安全：一次只允许一个请求）"""
     req_id = str(uuid.uuid4())[:8]
 
     def log_fn(level, msg):
         entry = json.dumps({"timestamp": datetime.now().strftime("%H:%M:%S"), "level": level, "message": msg})
         _broadcast(entry)
 
-    log_fn("info", f"[{req_id}] {log_msg}")
+    with _dispatch_lock:
+        log_fn("info", f"[{req_id}] {log_msg}")
 
-    _write_json(FILES["config"], {"request_id": req_id, "action": action, "config": config, "timestamp": time.time()})
+        _write_json(FILES["config"], {"request_id": req_id, "action": action, "config": config, "timestamp": time.time()})
 
-    if os.path.exists(FILES["result"]):
-        os.remove(FILES["result"])
+        try:
+            os.remove(FILES["result"])
+        except FileNotFoundError:
+            pass
 
-    timeout = 120 if action != "execute" else 300
-    for _ in range(timeout):
-        time.sleep(1)
-        result = _read_json(FILES["result"])
-        if result.get("request_id") == req_id:
-            if result.get("status") == "completed":
-                log_fn("success", f"[{req_id}] 完成: {len(result.get('output_files', []))} 条结果")
-                return jsonify(result)
-            elif result.get("status") == "error":
-                log_fn("error", f"[{req_id}] {result.get('detail', '错误')}")
-                return jsonify(result), 500
+        timeout = 120 if action != "execute" else 300
+        for _ in range(timeout):
+            time.sleep(1)
+            result = _read_json(FILES["result"])
+            if result.get("request_id") == req_id:
+                if result.get("status") == "completed":
+                    log_fn("success", f"[{req_id}] 完成: {len(result.get('output_files', []))} 条结果")
+                    return jsonify(result)
+                elif result.get("status") == "error":
+                    log_fn("error", f"[{req_id}] {result.get('detail', '错误')}")
+                    return jsonify(result), 500
 
-    log_fn("error", f"[{req_id}] 超时")
-    return jsonify(status="error", detail=f"超时({timeout}秒)"), 504
+        log_fn("error", f"[{req_id}] 超时")
+        return jsonify(status="error", detail=f"超时({timeout}秒)"), 504
 
 
 @app.route('/api/execute', methods=['POST'])

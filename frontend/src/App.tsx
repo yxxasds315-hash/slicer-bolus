@@ -8,7 +8,7 @@ import { RoiSelector } from './components/RoiSelector';
 import { ExportSettings } from './components/ExportSettings';
 import { ExecutionPanel } from './components/ExecutionPanel';
 import { SlicerMonitor } from './components/SlicerMonitor';
-import { useSSELog } from './hooks/useWebSocket';
+import { useSSELog } from './hooks/useSSELog';
 
 const defaultConfig: PipelineConfig = {
   dicom_dir: '', output_dir: '',

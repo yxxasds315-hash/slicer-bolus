@@ -1,0 +1,9 @@
+# macOS
+.DS_Store
+
+# 构建产物
+BolusDesigner.app/
+
+# 后端日志
+backend/server.log
+backend/*.bak
