@@ -160,18 +160,25 @@ def execute_pipeline(config):
 
     try:
         if design_method == "hollow":
-            # Hollow 抽壳法：COPY skin → Hollow 效果（均匀厚度壳体）
+            # Hollow 抽壳法：先向外膨胀，再向内抽壳
+            #   COPY skin → Margin +Nmm (外扩) → Hollow INSIDE_SURFACE Nmm (向内抽壳)
+            #   内表面 = 原始皮肤表面，外表面 = skin+Nmm，厚度 = Nmm 均匀壳体
             effect = _safe_get_effect(editorWidget, "Logical operators")
             effect.setParameter("Operation", "COPY")
             effect.setParameter("ModifierSegmentID", skin_id)
             effect.self().onApply()
             to_log("info", "  COPY skin → bolus")
 
+            effect = _safe_get_effect(editorWidget, "Margin")
+            effect.setParameter("MarginSizeMm", str(BOLUS_THICKNESS))
+            effect.self().onApply()
+            to_log("info", f"  Margin +{BOLUS_THICKNESS}mm (外扩)")
+
             effect = _safe_get_effect(editorWidget, "Hollow")
-            effect.setParameter("ShellMode", "OUTSIDE_SURFACE")
+            effect.setParameter("ShellMode", "INSIDE_SURFACE")
             effect.setParameter("ShellThicknessMm", str(BOLUS_THICKNESS))
             effect.self().onApply()
-            to_log("info", f"  Hollow OUTSIDE_SURFACE {BOLUS_THICKNESS}mm")
+            to_log("info", f"  Hollow INSIDE_SURFACE {BOLUS_THICKNESS}mm (向内抽壳)")
         else:
             # 偏移与相减法：COPY skin → Margin 膨胀 → SUBTRACT skin
             effect = _safe_get_effect(editorWidget, "Logical operators")
