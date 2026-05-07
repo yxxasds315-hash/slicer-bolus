@@ -144,6 +144,13 @@ def seal():
     return _dispatch_slicer(config, "seal", f"二次封口: 大核{k1}mm + 中核{k2}mm")
 
 
+@app.route('/api/export', methods=['POST'])
+def export_stl():
+    config = request.get_json(force=True)
+    names = config.get("export_models", [])
+    return _dispatch_slicer(config, "export", f"导出 STL: {', '.join(names)}")
+
+
 @app.route('/api/mold/generate', methods=['POST'])
 def mold_generate():
     config = request.get_json(force=True)

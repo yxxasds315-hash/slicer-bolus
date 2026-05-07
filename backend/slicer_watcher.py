@@ -545,6 +545,49 @@ def execute_create_roi(config):
     return [{"node": roi.GetID(), "name": roi.GetName(), "center": [round(c, 1) for c in center], "radius": [round(s / 2, 1) for s in size]}]
 
 
+def execute_export(config):
+    """导出选中的模型节点为 STL 文件到指定目录"""
+    import slicer, vtk, os
+
+    d = config
+    out_dir = d.get("output_dir", "").strip()
+    if not out_dir:
+        raise RuntimeError("未设置输出目录")
+
+    models = d.get("export_models", [])
+    if not models:
+        raise RuntimeError("未选择要导出的模型")
+
+    os.makedirs(out_dir, exist_ok=True)
+    exported = []
+
+    for model_name in models:
+        node = slicer.mrmlScene.GetFirstNodeByName(model_name)
+        if not node or not node.IsA("vtkMRMLModelNode"):
+            poly = vtk.vtkPolyData()
+            # also try to find from segmentation node
+            seg_node = slicer.mrmlScene.GetFirstNodeByName(SEG["node"])
+            if seg_node and seg_node.IsA("vtkMRMLSegmentationNode"):
+                seg = seg_node.GetSegmentation()
+                seg_id = seg.GetSegmentIdBySegmentName(model_name)
+                if seg_id:
+                    seg_node.CreateClosedSurfaceRepresentation()
+                    seg_node.GetClosedSurfaceRepresentation(seg_id, poly)
+            if poly.GetNumberOfPoints() == 0:
+                to_log("warning", f"  跳过 {model_name}: 未找到对应节点/段")
+                continue
+            node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", f"_export_{model_name}")
+            node.SetAndObservePolyData(poly)
+
+        path = os.path.join(out_dir, f"{model_name}.stl")
+        slicer.util.saveNode(node, path)
+        exported.append(path)
+        to_log("info", f"  导出 {model_name} → {path}")
+
+    to_log("success", f"导出完成: {len(exported)} 个文件")
+    return [{"exported": exported}]
+
+
 # ═══════════════════════════════════════════════
 #  模具生成模块
 # ═══════════════════════════════════════════════
@@ -922,6 +965,8 @@ def tick():
                 pending_job = lambda c=cfg: execute_create_roi(c["config"])
             elif action == "mold":
                 pending_job = lambda c=cfg: execute_mold(c["config"])
+            elif action == "export":
+                pending_job = lambda c=cfg: execute_export(c["config"])
             else:
                 pending_job = lambda c=cfg: execute_pipeline(c["config"])
 
