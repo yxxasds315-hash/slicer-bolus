@@ -52,7 +52,9 @@ def _apply_oversampling(seg_node, vol_node, factor, isotropic=True):
     geo_logic.SetReferenceImageGeometryInSegmentationNode()
     geo_logic.ResampleLabelmapsInSegmentationNode()
     seg = seg_node.GetSegmentation()
-    seg.SetConversionParameter("Oversampling factor", str(factor))
+    # 标记图已经超采样，闭曲面转换时不需要再做 oversampling（会导致双重细分 + 阶梯感）
+    seg.SetConversionParameter("Oversampling factor", "1.0")
+    seg.SetConversionParameter("Smoothing factor", "0.3")
     to_log("info", f"  [超采样] {factor}x, isotropic={isotropic}")
 
 
@@ -291,8 +293,6 @@ def execute_preview(config):
         editorWidget.setActiveEffectByName("")
         editorWidget.setMRMLScene(None)
         slicer.mrmlScene.RemoveNode(editorNode)
-
-    _apply_oversampling(seg_node, vol, d.get("oversampling", 2.0))
 
     seg_node.CreateClosedSurfaceRepresentation()
     display = seg_node.GetDisplayNode()
