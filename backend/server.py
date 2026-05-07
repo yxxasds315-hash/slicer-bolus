@@ -136,6 +136,13 @@ def seal():
     return _dispatch_slicer(config, "seal", f"二次封口: 大核{k1}mm + 中核{k2}mm")
 
 
+@app.route('/api/mold/generate', methods=['POST'])
+def mold_generate():
+    config = request.get_json(force=True)
+    t = config.get("thickness_mm", 5.0)
+    return _dispatch_slicer(config, "mold", f"模具生成: 壳体{config.get('mold_shell_thickness_mm', 4.0)}mm, bolus={t}mm")
+
+
 @app.route('/api/preview/finalize', methods=['POST'])
 def finalize_preview():
     config = request.get_json(force=True)

@@ -9,7 +9,7 @@ export function StepIndicator({ steps, currentStep, onStepClick }: StepIndicator
 interface WizardLayoutProps { children: React.ReactNode; currentStep: number; totalSteps?: number; onNext: () => void; onPrev: () => void; canNext: boolean; isLast: boolean; status: PipelineStatus; slicer?: SlicerState; slicerOnline?: boolean; onReconnect?: () => void; connecting?: boolean; }
 
 export function WizardLayout({ children, currentStep, totalSteps: _ts, onNext, onPrev, canNext, isLast, status, slicer, slicerOnline, onReconnect, connecting }: WizardLayoutProps) {
-  const steps = [{ id: 1, label: 'DICOM 加载', icon: '📁' },{ id: 2, label: '皮肤分割', icon: '🔪' },{ id: 3, label: 'ROI 选择', icon: '🎯' },{ id: 4, label: '补偿器设计', icon: '🔧' },{ id: 5, label: '导出设置', icon: '📤' },{ id: 6, label: '执行', icon: '▶' }];
+  const steps = [{ id: 1, label: 'DICOM 加载', icon: '📁' },{ id: 2, label: '皮肤分割', icon: '🔪' },{ id: 3, label: 'ROI 选择', icon: '🎯' },{ id: 4, label: '补偿器设计', icon: '🔧' },{ id: 5, label: '导出设置', icon: '📤' },{ id: 6, label: '执行', icon: '▶' },{ id: 7, label: '模具设计', icon: '🧱' }];
   const totalSteps = _ts || steps.length;
   return (
     <div className="min-h-screen flex flex-col items-center py-8 px-4 pb-16">

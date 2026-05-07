@@ -11,7 +11,17 @@ export interface PipelineConfig {
   roi_segment_id: string;
   seal_kernel_1_mm: number;
   seal_kernel_2_mm: number;
+  mold_shell_thickness_mm: number;
+  mold_base_thickness_mm: number;
+  mold_skin_padding_mm: number;
+  mold_pin_radius_mm: number;
+  mold_pin_height_mm: number;
+  mold_pin_clearance_mm: number;
+  mold_sprue_radius_mm: number;
+  mold_vent_radius_mm: number;
 }
+
+export type MoldStatus = 'idle' | 'running' | 'completed' | 'error';
 
 export interface LogEntry {
   timestamp: string;

@@ -8,6 +8,19 @@ RESULT_FILE = "/tmp/bolus_result.json"
 STATUS_FILE = "/tmp/bolus_status.json"
 LOG_FILE    = "/tmp/bolus_logs.jsonl"
 
+# ── Segment 命名空间（全局唯一，各步骤统一引用） ──
+SEG = {
+    "node":               "BolusSegmentation",
+    "skin":               "Skin",
+    "cutter":             "Cutter_Mask",
+    "temp_air":           "__Temp_Outside_Air__",
+    "temp_bolus_expanded": "__Bolus_Expanded__",
+}
+
+def _bolus_name(thickness_mm: float) -> str:
+    """由厚度推导补偿器 segment 名称，全流程统一。"""
+    return f"Bolus_{thickness_mm}mm"
+
 
 def to_log(level, msg):
     entry = json.dumps({"timestamp": time.strftime("%H:%M:%S"), "level": level, "message": msg})
@@ -62,20 +75,20 @@ def execute_pipeline(config):
     # Step 2: 校验已有分割节点
     to_log("info", "[2/5] 校验分割节点...")
 
-    seg_node = slicer.mrmlScene.GetFirstNodeByName("BolusSegmentation")
+    seg_node = slicer.mrmlScene.GetFirstNodeByName(SEG["node"])
     if not seg_node or not seg_node.IsA("vtkMRMLSegmentationNode"):
-        raise RuntimeError("未找到 BolusSegmentation 节点, 请先在步骤2中执行预览分割")
+        raise RuntimeError(f"未找到 {SEG['node']} 节点, 请先在步骤2中执行预览分割")
     seg = seg_node.GetSegmentation()
-    skin_id = seg.GetSegmentIdBySegmentName("Skin")
+    skin_id = seg.GetSegmentIdBySegmentName(SEG["skin"])
     if not skin_id:
-        raise RuntimeError("未找到 Skin 段, 请重新运行预览步骤")
-    to_log("info", "  校验通过: Skin 段存在")
+        raise RuntimeError(f"未找到 {SEG['skin']} 段, 请重新运行预览步骤")
+    to_log("info", f"  校验通过: {SEG['skin']} 段存在")
 
     # Step 3: 补偿器设计 (COPY→Grow→Subtract→Intersect)
     to_log("info", f"[3/5] 补偿器设计 (thickness={d['thickness_mm']}mm)...")
 
     BOLUS_THICKNESS = d["thickness_mm"]
-    bolus_name = f"Bolus_{BOLUS_THICKNESS}mm"
+    bolus_name = _bolus_name(BOLUS_THICKNESS)
 
     old_bolus = seg.GetSegmentIdBySegmentName(bolus_name)
     if old_bolus:
@@ -83,12 +96,20 @@ def execute_pipeline(config):
     bolus_id = seg.AddEmptySegment(bolus_name, bolus_name, [0.2, 0.6, 0.9])
 
     roi_nodes = slicer.util.getNodesByClass("vtkMRMLMarkupsROINode")
-    if not roi_nodes:
-        raise RuntimeError("未找到 Markups ROI 节点, 请先在步骤3中放置 ROI 盒子")
-    roi = roi_nodes[0]
-    to_log("info", f"  使用 ROI: {roi.GetName()}")
-    bounds = [0]*6
-    roi.GetRASBounds(bounds)
+    if roi_nodes:
+        roi = roi_nodes[0]
+        to_log("info", f"  使用 ROI: {roi.GetName()}")
+        bounds = [0]*6
+        roi.GetRASBounds(bounds)
+    else:
+        to_log("info", "  无 ROI，使用皮肤边界作为默认裁切区域")
+        skin_poly = vtk.vtkPolyData()
+        seg_node.GetClosedSurfaceRepresentation(skin_id, skin_poly)
+        if skin_poly.GetNumberOfPoints() == 0:
+            seg_node.CreateClosedSurfaceRepresentation()
+            seg_node.GetClosedSurfaceRepresentation(skin_id, skin_poly)
+        bounds = [0]*6
+        skin_poly.GetBounds(bounds)
 
     sizes = [bounds[1]-bounds[0], bounds[3]-bounds[2], bounds[5]-bounds[4]]
     min_axis = sizes.index(min(sizes))
@@ -102,11 +123,10 @@ def execute_pipeline(config):
     cube.SetBounds(bounds)
     cube.Update()
 
-    cutter_name = "Cutter_Mask"
-    old_cutter = seg.GetSegmentIdBySegmentName(cutter_name)
+    old_cutter = seg.GetSegmentIdBySegmentName(SEG["cutter"])
     if old_cutter:
         seg.RemoveSegment(old_cutter)
-    cutter_id = seg_node.AddSegmentFromClosedSurfaceRepresentation(cube.GetOutput(), cutter_name, [1, 0, 0])
+    cutter_id = seg_node.AddSegmentFromClosedSurfaceRepresentation(cube.GetOutput(), SEG["cutter"], [1, 0, 0])
     seg.CreateRepresentation(slicer.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName())
     to_log("info", "  Cutter 掩膜已创建并光栅化")
 
@@ -193,16 +213,16 @@ def execute_preview(config):
 
     to_log("info", "[2/3] 皮肤分割...")
 
-    old = slicer.mrmlScene.GetFirstNodeByName("BolusSegmentation")
+    old = slicer.mrmlScene.GetFirstNodeByName(SEG["node"])
     if old:
         slicer.mrmlScene.RemoveNode(old)
 
     seg_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
-    seg_node.SetName("BolusSegmentation")
+    seg_node.SetName(SEG["node"])
     seg_node.CreateDefaultDisplayNodes()
     seg_node.SetReferenceImageGeometryParameterFromVolumeNode(vol)
 
-    skin_id = seg_node.GetSegmentation().AddEmptySegment("Skin", "Skin", [0.2, 0.8, 0.3])
+    skin_id = seg_node.GetSegmentation().AddEmptySegment(SEG["skin"], SEG["skin"], [0.2, 0.8, 0.3])
     seg = seg_node.GetSegmentation()
 
     editorNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentEditorNode")
@@ -241,13 +261,13 @@ def execute_activate_scissors(config):
 
     to_log("info", "========== 激活 Scissors 剪裁工具 ==========")
 
-    seg_node = slicer.mrmlScene.GetFirstNodeByName("BolusSegmentation")
+    seg_node = slicer.mrmlScene.GetFirstNodeByName(SEG["node"])
     if not seg_node:
         raise RuntimeError("未找到分割节点, 请先运行预览")
     seg = seg_node.GetSegmentation()
-    skin_id = seg.GetSegmentIdBySegmentName("Skin")
+    skin_id = seg.GetSegmentIdBySegmentName(SEG["skin"])
     if not skin_id:
-        raise RuntimeError("未找到 Skin 段")
+        raise RuntimeError(f"未找到 {SEG['skin']} 段")
 
     vol = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")[0]
 
@@ -275,13 +295,13 @@ def execute_finalize_preview(config):
     d = config
     to_log("info", "========== 完成分割: 去杂讯 + 平滑 ==========")
 
-    seg_node = slicer.mrmlScene.GetFirstNodeByName("BolusSegmentation")
+    seg_node = slicer.mrmlScene.GetFirstNodeByName(SEG["node"])
     if not seg_node:
         raise RuntimeError("未找到分割节点")
     seg = seg_node.GetSegmentation()
-    skin_id = seg.GetSegmentIdBySegmentName("Skin")
+    skin_id = seg.GetSegmentIdBySegmentName(SEG["skin"])
     if not skin_id:
-        raise RuntimeError("未找到 Skin 段")
+        raise RuntimeError(f"未找到 {SEG['skin']} 段")
 
     editorNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentEditorNode")
     editorWidget = slicer.qMRMLSegmentEditorWidget()
@@ -332,13 +352,13 @@ def execute_solidify(config):
 
     to_log("info", "========== 实心化: 填充内部空腔 ==========")
 
-    seg_node = slicer.mrmlScene.GetFirstNodeByName("BolusSegmentation")
+    seg_node = slicer.mrmlScene.GetFirstNodeByName(SEG["node"])
     if not seg_node:
-        raise RuntimeError("未找到 BolusSegmentation 节点, 请先运行预览")
+        raise RuntimeError(f"未找到 {SEG['node']} 节点, 请先运行预览")
     seg = seg_node.GetSegmentation()
-    skin_id = seg.GetSegmentIdBySegmentName("Skin")
+    skin_id = seg.GetSegmentIdBySegmentName(SEG["skin"])
     if not skin_id:
-        raise RuntimeError("未找到 Skin 段")
+        raise RuntimeError(f"未找到 {SEG['skin']} 段")
 
     vol = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")[0]
 
@@ -366,7 +386,7 @@ def execute_solidify(config):
     })
 
     to_log("info", "[2/4] 构建外部空气掩膜...")
-    AIR_NAME = "__Temp_Outside_Air__"
+    AIR_NAME = SEG["temp_air"]
     existing_air_id = seg.GetSegmentIdBySegmentName(AIR_NAME)
     if existing_air_id:
         seg.RemoveSegment(existing_air_id)
@@ -406,13 +426,13 @@ def execute_seal(config):
 
     to_log("info", f"========== 二次封口: 大核{k1}mm / 中核{k2}mm ==========")
 
-    seg_node = slicer.mrmlScene.GetFirstNodeByName("BolusSegmentation")
+    seg_node = slicer.mrmlScene.GetFirstNodeByName(SEG["node"])
     if not seg_node:
-        raise RuntimeError("未找到 BolusSegmentation 节点, 请先运行预览")
+        raise RuntimeError(f"未找到 {SEG['node']} 节点, 请先运行预览")
     seg = seg_node.GetSegmentation()
-    skin_id = seg.GetSegmentIdBySegmentName("Skin")
+    skin_id = seg.GetSegmentIdBySegmentName(SEG["skin"])
     if not skin_id:
-        raise RuntimeError("未找到 Skin 段")
+        raise RuntimeError(f"未找到 {SEG['skin']} 段")
 
     vol = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")[0]
 
@@ -489,7 +509,249 @@ def execute_create_roi(config):
     return [{"node": roi.GetID(), "name": roi.GetName(), "center": [round(c, 1) for c in center], "radius": [round(s / 2, 1) for s in size]}]
 
 
-import qt, slicer
+# ═══════════════════════════════════════════════
+#  模具生成模块
+# ═══════════════════════════════════════════════
+
+def _get_segment_polydata(seg_node, segment_name):
+    seg = seg_node.GetSegmentation()
+    seg_id = seg.GetSegmentIdBySegmentName(segment_name)
+    if not seg_id:
+        names = [seg.GetNthSegment(i).GetName() for i in range(seg.GetNumberOfSegments())]
+        raise RuntimeError(f"找不到 segment '{segment_name}'，现有: {names}")
+    poly = vtk.vtkPolyData()
+    seg_node.GetClosedSurfaceRepresentation(seg_id, poly)
+    if poly.GetNumberOfPoints() == 0:
+        seg_node.CreateClosedSurfaceRepresentation()
+        seg_node.GetClosedSurfaceRepresentation(seg_id, poly)
+    to_log("info", f"  [✓] {segment_name}: {poly.GetNumberOfPoints():,} pts, {poly.GetNumberOfCells():,} cells")
+    return poly
+
+
+def _poly_boolean(poly_a, poly_b, operation):
+    def _triangulate(poly):
+        tri = vtk.vtkTriangleFilter()
+        tri.SetInputData(poly)
+        tri.Update()
+        norm = vtk.vtkPolyDataNormals()
+        norm.SetInputData(tri.GetOutput())
+        norm.ConsistencyOn()
+        norm.AutoOrientNormalsOn()
+        norm.Update()
+        return norm.GetOutput()
+
+    a = _triangulate(poly_a)
+    b = _triangulate(poly_b)
+
+    if operation == "difference":
+        op_val = vtk.vtkBooleanOperationPolyDataFilter.VTK_DIFFERENCE
+    elif operation == "union":
+        op_val = vtk.vtkBooleanOperationPolyDataFilter.VTK_UNION
+    elif operation == "intersection":
+        op_val = vtk.vtkBooleanOperationPolyDataFilter.VTK_INTERSECTION
+    else:
+        raise ValueError(f"未知布尔操作: {operation}")
+
+    boolean_filter = vtk.vtkBooleanOperationPolyDataFilter()
+    boolean_filter.SetOperation(op_val)
+    boolean_filter.SetInputData(0, a)
+    boolean_filter.SetInputData(1, b)
+    boolean_filter.ReorientDifferenceCellsOn()
+    boolean_filter.Update()
+    result = boolean_filter.GetOutput()
+    to_log("info", f"  [{operation}] → {result.GetNumberOfPoints():,} pts")
+    return result
+
+
+def _apply_margin_to_segment(seg_node, segment_name, margin_mm, new_name):
+    seg = seg_node.GetSegmentation()
+    src_id = seg.GetSegmentIdBySegmentName(segment_name)
+    new_id = seg.AddEmptySegment(new_name)
+    seg.CopySegment(new_id, src_id)
+    to_log("info", f"  [复制] {segment_name} → {new_name}")
+    ref_volume = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
+    if ref_volume is None:
+        raise RuntimeError("场景中无体积数据，无法执行 Margin 膨胀。请先完成 DICOM 加载和预览分割。")
+    seg_editor_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentEditorNode")
+    seg_editor_widget = slicer.qMRMLSegmentEditorWidget()
+    seg_editor_widget.setMRMLScene(slicer.mrmlScene)
+    seg_editor_widget.setMRMLSegmentEditorNode(seg_editor_node)
+    seg_editor_widget.setSegmentationNode(seg_node)
+    seg_editor_widget.setSourceVolumeNode(ref_volume)
+    seg_editor_node.SetSelectedSegmentID(new_id)
+    seg_editor_widget.setActiveEffectByName("Margin")
+    effect = seg_editor_widget.activeEffect()
+    effect.setParameter("MarginSizeMm", str(margin_mm))
+    effect.self().onApply()
+    to_log("info", f"  [Margin +{margin_mm}mm] 完成")
+    seg_editor_widget.setActiveEffectByName("")
+    seg_editor_widget.setMRMLScene(None)
+    slicer.mrmlScene.RemoveNode(seg_editor_node)
+    return new_id
+
+
+def _make_cylinder_poly(cx, cy, cz, radius, height, resolution=32):
+    cyl = vtk.vtkCylinderSource()
+    cyl.SetCenter(cx, cy, cz)
+    cyl.SetRadius(radius)
+    cyl.SetHeight(height)
+    cyl.SetResolution(resolution)
+    cyl.CappingOn()
+    cyl.Update()
+    transform = vtk.vtkTransform()
+    transform.RotateX(90)
+    tf_filter = vtk.vtkTransformPolyDataFilter()
+    tf_filter.SetInputData(cyl.GetOutput())
+    tf_filter.SetTransform(transform)
+    tf_filter.Update()
+    return tf_filter.GetOutput()
+
+
+def _make_box_poly(cx, cy, cz, sx, sy, sz):
+    box = vtk.vtkCubeSource()
+    box.SetCenter(cx, cy, cz)
+    box.SetXLength(sx)
+    box.SetYLength(sy)
+    box.SetZLength(sz)
+    box.Update()
+    tri = vtk.vtkTriangleFilter()
+    tri.SetInputData(box.GetOutput())
+    tri.Update()
+    return tri.GetOutput()
+
+
+def _add_model_to_scene(poly, name, color=(0.8, 0.5, 0.3), opacity=0.7):
+    node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", name)
+    node.SetAndObservePolyData(poly)
+    disp = node.CreateDefaultDisplayNodes()
+    disp.SetColor(*color)
+    disp.SetOpacity(opacity)
+    to_log("info", f"  [显示] {name} → 3D 视图")
+    return node
+
+
+def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm):
+    to_log("info", "── 阴模生成 ──")
+    bolus_poly = _get_segment_polydata(seg_node, bolus_name)
+    _apply_margin_to_segment(seg_node, bolus_name, shell_mm, SEG["temp_bolus_expanded"])
+    expanded_poly = _get_segment_polydata(seg_node, SEG["temp_bolus_expanded"])
+    shell = _poly_boolean(expanded_poly, bolus_poly, "difference")
+    skin_poly = _get_segment_polydata(seg_node, skin_name)
+    female = _poly_boolean(shell, skin_poly, "difference")
+    to_log("info", f"  [阴模] {female.GetNumberOfPoints():,} pts")
+    return female
+
+
+def _make_male_mold(seg_node, bolus_name, skin_name, skin_padding_mm, base_thickness_mm):
+    to_log("info", "── 阳模生成 ──")
+    bolus_poly = _get_segment_polydata(seg_node, bolus_name)
+    skin_poly = _get_segment_polydata(seg_node, skin_name)
+    b = bolus_poly.GetBounds()
+    pad = skin_padding_mm
+    bx = (b[1] - b[0]) + 2 * pad
+    by = (b[3] - b[2]) + 2 * pad
+    bz = 500.0
+    cx = (b[0] + b[1]) / 2
+    cy = (b[2] + b[3]) / 2
+    cz = b[4] - bz / 2 + 10
+    clip_box = _make_box_poly(cx, cy, cz, bx, by, bz)
+    skin_region = _poly_boolean(skin_poly, clip_box, "intersection")
+    sb = skin_region.GetBounds()
+    z_bot = sb[4]
+    base = _make_box_poly(cx, cy, z_bot - base_thickness_mm / 2, bx, by, base_thickness_mm)
+    male = _poly_boolean(skin_region, base, "union")
+    to_log("info", f"  [阳模] {male.GetNumberOfPoints():,} pts")
+    return male
+
+
+def _add_pins(female_poly, male_poly, pin_radius_mm, pin_height_mm, pin_clearance_mm):
+    to_log("info", "── 对准销 ──")
+    b = female_poly.GetBounds()
+    cx = (b[0] + b[1]) / 2
+    cy = (b[2] + b[3]) / 2
+    z_pin = (b[4] + b[5]) / 2
+    dx = (b[1] - b[0]) * 0.28
+    dy = (b[3] - b[2]) * 0.28
+    positions = [(cx + dx, cy + dy), (cx - dx, cy + dy), (cx + dx, cy - dy), (cx - dx, cy - dy)]
+    r = pin_radius_mm
+    h = pin_height_mm
+    clr = pin_clearance_mm
+    for (px, py) in positions:
+        solid = _make_cylinder_poly(px, py, z_pin, r, h)
+        hole = _make_cylinder_poly(px, py, z_pin, r + clr, h + 1.0)
+        female_poly = _poly_boolean(female_poly, hole, "difference")
+        male_poly = _poly_boolean(male_poly, solid, "union")
+        to_log("info", f"  [销] ({px:.1f}, {py:.1f}, {z_pin:.1f})")
+    return female_poly, male_poly
+
+
+def _add_sprue_and_vents(female_poly, sprue_radius_mm, vent_radius_mm):
+    to_log("info", "── 注料口 & 排气孔 ──")
+    b = female_poly.GetBounds()
+    cx = (b[0] + b[1]) / 2
+    cy = (b[2] + b[3]) / 2
+    cz = (b[4] + b[5]) / 2
+    h_thru = (b[5] - b[4]) + 4
+    sprue = _make_cylinder_poly(cx, cy, cz, sprue_radius_mm, h_thru)
+    vent1 = _make_cylinder_poly(cx + 20, cy, cz, vent_radius_mm, h_thru)
+    vent2 = _make_cylinder_poly(cx - 20, cy, cz, vent_radius_mm, h_thru)
+    result = _poly_boolean(female_poly, sprue, "difference")
+    result = _poly_boolean(result, vent1, "difference")
+    result = _poly_boolean(result, vent2, "difference")
+    to_log("info", f"  [注料口] r={sprue_radius_mm}mm | [排气孔] r={vent_radius_mm}mm ×2")
+    return result
+
+
+def execute_mold(config):
+    import slicer
+    d = config
+    BOLUS_THICKNESS = d.get("thickness_mm", 5.0)
+    bolus_name = _bolus_name(BOLUS_THICKNESS)
+
+    to_log("info", f"========== 模具生成: bolus={bolus_name}, 壳体={d.get('mold_shell_thickness_mm', 4.0)}mm ==========")
+
+    seg_node = slicer.mrmlScene.GetFirstNodeByName(SEG["node"])
+    if not seg_node or not seg_node.IsA("vtkMRMLSegmentationNode"):
+        raise RuntimeError(f"未找到分割节点 '{SEG['node']}'，请先完成皮肤分割和补偿器设计")
+
+    seg = seg_node.GetSegmentation()
+    if not seg.GetSegmentIdBySegmentName(bolus_name):
+        names = [seg.GetNthSegment(i).GetName() for i in range(seg.GetNumberOfSegments())]
+        raise RuntimeError(f"未找到 '{bolus_name}'，现有: {names}。请先完成第6步补偿器执行。")
+    if not seg.GetSegmentIdBySegmentName(SEG["skin"]):
+        raise RuntimeError(f"未找到 '{SEG['skin']}' 段，请先完成预览分割")
+
+    shell_mm = d.get("mold_shell_thickness_mm", 4.0)
+    base_mm = d.get("mold_base_thickness_mm", 2.5)
+    skin_pad_mm = d.get("mold_skin_padding_mm", 6.0)
+    pin_r = d.get("mold_pin_radius_mm", 2.0)
+    pin_h = d.get("mold_pin_height_mm", 8.0)
+    pin_clr = d.get("mold_pin_clearance_mm", 0.20)
+    sprue_r = d.get("mold_sprue_radius_mm", 3.0)
+    vent_r = d.get("mold_vent_radius_mm", 1.0)
+
+    female = _make_female_mold(seg_node, bolus_name, skin_name, shell_mm)
+    male = _make_male_mold(seg_node, bolus_name, skin_name, skin_pad_mm, base_mm)
+    female, male = _add_pins(female, male, pin_r, pin_h, pin_clr)
+    female = _add_sprue_and_vents(female, sprue_r, vent_r)
+
+    _add_model_to_scene(female, "Mold_Female_Conformal", color=(0.87, 0.49, 0.33), opacity=0.75)
+    _add_model_to_scene(male, "Mold_Male_Base", color=(0.36, 0.55, 0.93), opacity=0.75)
+
+    # 清理临时 segment
+    tmp_id = seg.GetSegmentIdBySegmentName(SEG["temp_bolus_expanded"])
+    if tmp_id:
+        seg.RemoveSegment(tmp_id)
+
+    to_log("success", "模具生成完成 — Mold_Female_Conformal（橙色）+ Mold_Male_Base（蓝色）")
+
+    return [
+        {"node": "Mold_Female_Conformal", "type": "female", "vertices": female.GetNumberOfPoints()},
+        {"node": "Mold_Male_Base", "type": "male", "vertices": male.GetNumberOfPoints()},
+    ]
+
+
+import qt, slicer, vtk
 
 layoutManager = slicer.app.layoutManager()
 layoutManager.setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
@@ -558,6 +820,8 @@ def tick():
                 pending_job = lambda c=cfg: execute_finalize_preview(c["config"])
             elif action == "create_roi":
                 pending_job = lambda c=cfg: execute_create_roi(c["config"])
+            elif action == "mold":
+                pending_job = lambda c=cfg: execute_mold(c["config"])
             else:
                 pending_job = lambda c=cfg: execute_pipeline(c["config"])
 
