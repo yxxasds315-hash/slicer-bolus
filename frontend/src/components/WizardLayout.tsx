@@ -6,9 +6,28 @@ export function StepIndicator({ steps, currentStep, onStepClick }: StepIndicator
   return (<div className="flex items-center justify-center gap-0 mb-8">{steps.map((step, i) => (<div key={step.id} className="flex items-center"><button onClick={() => onStepClick(step.id)} className="flex items-center gap-2 group"><div className={`w-10 h-10 rounded-full flex items-center justify-center text-sm font-bold transition-all duration-300 ${currentStep === step.id ? 'bg-accent-400 text-medical-900 scale-110 shadow-lg shadow-accent-400/20' : currentStep > step.id ? 'bg-success text-white' : 'bg-medical-700 text-medical-500'}`}>{currentStep > step.id ? '✓' : step.icon}</div><span className={`hidden lg:inline text-sm whitespace-nowrap ${currentStep === step.id ? 'text-accent-200' : 'text-medical-500'}`}>{step.label}</span></button>{i < steps.length - 1 && <div className={`w-8 lg:w-16 h-0.5 mx-2 ${currentStep > step.id ? 'bg-success' : 'bg-medical-700'}`} />}</div>))}</div>);
 }
 
-interface WizardLayoutProps { children: React.ReactNode; currentStep: number; totalSteps?: number; onNext: () => void; onPrev: () => void; canNext: boolean; isLast: boolean; status: PipelineStatus; slicer?: SlicerState; slicerOnline?: boolean; onReconnect?: () => void; connecting?: boolean; }
+interface WizardLayoutProps { children: React.ReactNode; currentStep: number; totalSteps?: number; onNext: () => void; onPrev: () => void; canNext: boolean; isLast: boolean; status: PipelineStatus; slicer?: SlicerState; slicerOnline?: boolean; onReconnect?: () => void; connecting?: boolean; onJumpToStep?: (step: number) => void; }
 
-export function WizardLayout({ children, currentStep, totalSteps: _ts, onNext, onPrev, canNext, isLast, status, slicer, slicerOnline, onReconnect, connecting }: WizardLayoutProps) {
+function detectCompletedSteps(slicer?: SlicerState): Set<number> {
+  const done = new Set<number>();
+  if (!slicer) return done;
+  if (slicer.volumes.length > 0) done.add(1);
+  const allSegs = slicer.segmentations.flatMap(s => s.segments);
+  if (allSegs.includes('Skin')) done.add(2);
+  if (allSegs.some(s => /^Bolus_\d+mm$/.test(s))) done.add(6);
+  if (slicer.models?.some(m => m.name === 'Mold_Female_Conformal')) done.add(7);
+  return done;
+}
+
+function getJumpTarget(done: Set<number>, current: number): { step: number; label: string } | null {
+  const milestones: [number, string][] = [[7, '模具已生成'], [6, '补偿器已生成'], [2, '皮肤分割已完成'], [1, 'DICOM 已加载']];
+  for (const [step, label] of milestones) {
+    if (done.has(step) && step > current) return { step, label };
+  }
+  return null;
+}
+
+export function WizardLayout({ children, currentStep, totalSteps: _ts, onNext, onPrev, canNext, isLast, status, slicer, slicerOnline, onReconnect, connecting, onJumpToStep }: WizardLayoutProps) {
   const steps = [{ id: 1, label: 'DICOM 加载', icon: '📁' },{ id: 2, label: '皮肤分割', icon: '🔪' },{ id: 3, label: 'ROI 选择', icon: '🎯' },{ id: 4, label: '补偿器设计', icon: '🔧' },{ id: 5, label: '导出设置', icon: '📤' },{ id: 6, label: '执行', icon: '▶' },{ id: 7, label: '模具设计', icon: '🧱' }];
   const totalSteps = _ts || steps.length;
   return (
@@ -19,6 +38,7 @@ export function WizardLayout({ children, currentStep, totalSteps: _ts, onNext, o
       <StepIndicator steps={steps} currentStep={currentStep} onStepClick={() => {}} status={status} />
       <div className="wizard-card w-full max-w-xl p-6">
         <h2 className="text-lg font-semibold text-accent-200 mb-4">{steps[currentStep - 1].icon} 第 {currentStep} 步：{steps[currentStep - 1].label}</h2>
+        {onJumpToStep && (() => { const done = detectCompletedSteps(slicer); const target = getJumpTarget(done, currentStep); if (!target) return null; return (<div className="mb-4 px-4 py-3 bg-accent-400/10 border border-accent-400/30 rounded-lg flex items-center justify-between"><div className="flex items-center gap-2 text-sm"><span className="text-accent-300">✅</span><span className="text-medical-300">检测到 {target.label}</span></div><button onClick={() => onJumpToStep(target.step)} className="px-3 py-1.5 bg-accent-400 text-medical-900 rounded-md text-xs font-bold hover:bg-accent-300 transition-colors">跳转至步骤 {target.step} →</button></div>); })()}
         <div className="min-h-[280px]">{children}</div>
         <div className="flex justify-between mt-6 pt-4 border-t border-medical-700"><button onClick={onPrev} disabled={currentStep === 1} className="btn-secondary text-sm disabled:opacity-30 disabled:cursor-not-allowed">← 上一步</button><div className="text-medical-500 text-sm self-center">{currentStep} / {totalSteps}</div><button onClick={onNext} disabled={!canNext || status === 'running'} className="btn-primary text-sm">{isLast ? (status === 'running' ? '运行中...' : '▶ 执行') : '下一步 →'}</button></div>
       </div>

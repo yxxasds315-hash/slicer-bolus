@@ -2,7 +2,7 @@
 Bolus Designer — Flask 后端 (独立进程, 不依赖 Slicer 进程的 socket)
 通过文件与 Slicer 通信
 """
-import json, logging, os, time, threading, queue, uuid
+import json, logging, os, time, threading, queue, uuid, subprocess
 from datetime import datetime
 
 FILES = {
@@ -62,7 +62,15 @@ def health():
         slicer_alive = (time.time() - mtime) < 10
     except OSError:
         pass
-    return jsonify(status='ok', slicer_running=slicer_alive)
+
+    slicer_process = False
+    try:
+        r = subprocess.run(['pgrep', '-f', '/Applications/Slicer.app/Contents/MacOS/Slicer'], capture_output=True)
+        slicer_process = r.returncode == 0
+    except Exception:
+        pass
+
+    return jsonify(status='ok', slicer_running=slicer_alive, slicer_process_running=slicer_process)
 
 
 @app.route('/api/slicer/status')

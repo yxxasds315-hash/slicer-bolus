@@ -29,7 +29,7 @@ const defaultConfig: PipelineConfig = {
   mold_vent_radius_mm: 1.0,
 };
 
-type ConnStatus = 'checking' | 'online' | 'offline' | 'launching';
+type ConnStatus = 'checking' | 'online' | 'offline' | 'no_watcher' | 'launching';
 
 export default function App() {
   const [config, setConfig] = useState<PipelineConfig>(defaultConfig);
@@ -55,7 +55,19 @@ export default function App() {
         const r = await fetch('/api/health');
         const d = await r.json();
         if (cancelled) return;
-        if (d.status === 'ok') { setConn('online'); setSlicerOnline(d.slicer_running === true); try { const sr = await fetch('/api/slicer/status'); const sd = await sr.json(); if (!cancelled && sd && typeof sd === 'object') setSlicer(prev => ({ ...prev, ...sd })); } catch { } }
+        if (d.status === 'ok') {
+          const watcherActive = d.slicer_running === true;
+          const processAlive = d.slicer_process_running === true;
+          setSlicerOnline(watcherActive);
+          if (watcherActive) {
+            setConn('online');
+            try { const sr = await fetch('/api/slicer/status'); const sd = await sr.json(); if (!cancelled && sd && typeof sd === 'object') setSlicer(prev => ({ ...prev, ...sd })); } catch { }
+          } else if (processAlive && !watcherActive) {
+            setConn('no_watcher');
+          } else {
+            setConn('offline');
+          }
+        }
         else { setConn('offline'); setSlicerOnline(false); }
       } catch { if (!cancelled) { setConn('offline'); setSlicerOnline(false); } }
     };
@@ -91,6 +103,13 @@ export default function App() {
 
   const executePipeline = async () => { setPipeStatus('running'); setLocalLogs([]); clearLogs(); addLocalLog('info', 'Starting pipeline...'); try { const r = await fetch('/api/execute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...config, use_existing_volumes: config.dicom_dir === '__slicer__' }) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || 'Failed'); } const d = await r.json(); addLocalLog('success', `Done! ${d.output_files?.join(', ') || ''}`); setPipeStatus('completed'); } catch (err: any) { addLocalLog('error', err.message); setPipeStatus('error'); } };
 
+  const handleJumpToStep = (target: number) => {
+    if (target >= 2) setPreviewStatus('done');
+    if (target >= 6) setPipeStatus('completed');
+    if (target >= 7) setMoldStatus('completed');
+    setStep(target);
+  };
+
   const renderStep = () => {
     switch (step) {
       case 1: return <DicomSelector config={config} onChange={updateConfig} slicer={slicer} />;
@@ -103,7 +122,12 @@ export default function App() {
     }
   };
 
-  if (conn !== 'online') return (<><div className="min-h-screen flex items-center justify-center bg-medical-900 pb-12"><div className="wizard-card w-full max-w-md p-8 text-center"><h1 className="text-2xl font-bold text-accent-200 mb-2">Bolus Designer</h1><p className="text-medical-500 text-sm mb-8">放疗个性化补偿器数字化设计平台</p><div className="mb-6">{conn === 'checking' ? <div className="animate-spin inline-block w-8 h-8 border-2 border-accent-400 border-t-transparent rounded-full" /> : conn === 'launching' ? <><div className="animate-spin inline-block w-8 h-8 border-2 border-accent-400 border-t-transparent rounded-full mb-3" /><p className="text-accent-300 text-sm">Starting...</p></> : <div className="text-5xl mb-3">🔬</div>}<p className="text-medical-400 text-sm mt-3">{conn === 'checking' ? '检测中...' : conn === 'launching' ? '启动中...' : 'Slicer 未连接'}</p></div><button onClick={launchSlicer} disabled={conn === 'launching' || conn === 'checking'} className="btn-primary w-full mb-3 text-base">{conn === 'launching' ? '启动中...' : '🚀 启动 3D Slicer'}</button>{launchLog && <div className="log-stream mt-4 text-left"><pre className="text-xs text-gray-300 whitespace-pre-wrap">{launchLog}</pre></div>}</div></div><SlicerMonitor slicer={slicer} slicerOnline={slicerOnline} logs={logs} pipeStatus={pipeStatus} /></>);
+  if (conn !== 'online') {
+    const statusText = conn === 'checking' ? '检测中...' : conn === 'launching' ? '启动中...' : conn === 'no_watcher' ? 'Slicer 已运行但未加载桥接脚本' : 'Slicer 未连接';
+    const isSpinning = conn === 'checking' || conn === 'launching';
+    const isNoWatcher = conn === 'no_watcher';
+    return (<><div className="min-h-screen flex items-center justify-center bg-medical-900 pb-12"><div className="wizard-card w-full max-w-md p-8 text-center"><h1 className="text-2xl font-bold text-accent-200 mb-2">Bolus Designer</h1><p className="text-medical-500 text-sm mb-8">放疗个性化补偿器数字化设计平台</p><div className="mb-6">{isSpinning ? <div className="animate-spin inline-block w-8 h-8 border-2 border-accent-400 border-t-transparent rounded-full" /> : isNoWatcher ? <div className="text-5xl mb-3">⚠️</div> : <div className="text-5xl mb-3">🔬</div>}<p className={`text-sm mt-3 ${isNoWatcher ? 'text-warning font-medium' : 'text-medical-400'}`}>{statusText}</p>{isNoWatcher && <p className="text-xs text-medical-500 mt-2">Slicer 进程已运行，但未通过 --python-script 加载桥接脚本。<br/>点击下方按钮自动修复（关闭并重启 Slicer）。</p>}</div><button onClick={launchSlicer} disabled={conn === 'launching' || conn === 'checking'} className="btn-primary w-full mb-3 text-base">{conn === 'launching' ? '启动中...' : isNoWatcher ? '🔧 自动修复并重启 Slicer' : '🚀 启动 3D Slicer'}</button>{launchLog && <div className="log-stream mt-4 text-left"><pre className="text-xs text-gray-300 whitespace-pre-wrap">{launchLog}</pre></div>}</div></div><SlicerMonitor slicer={slicer} slicerOnline={slicerOnline} logs={logs} pipeStatus={pipeStatus} /></>);
+  }
 
-  return (<><WizardLayout currentStep={step} totalSteps={7} onNext={handleNext} onPrev={() => { const prev = Math.max(step - 1, 1); setStep(prev); if (step >= 6) setPipeStatus('idle'); if (step === 7) setMoldStatus('idle'); }} canNext={canNext()} isLast={step === 7} status={pipeStatus} slicer={slicer} slicerOnline={slicerOnline} onReconnect={launchSlicer} connecting={conn === 'launching'}>{renderStep()}</WizardLayout><SlicerMonitor slicer={slicer} slicerOnline={slicerOnline} logs={logs} pipeStatus={pipeStatus} /></>);
+  return (<><WizardLayout currentStep={step} totalSteps={7} onNext={handleNext} onPrev={() => { const prev = Math.max(step - 1, 1); setStep(prev); if (step >= 6) setPipeStatus('idle'); if (step === 7) setMoldStatus('idle'); }} canNext={canNext()} isLast={step === 7} status={pipeStatus} slicer={slicer} slicerOnline={slicerOnline} onReconnect={launchSlicer} connecting={conn === 'launching'} onJumpToStep={handleJumpToStep}>{renderStep()}</WizardLayout><SlicerMonitor slicer={slicer} slicerOnline={slicerOnline} logs={logs} pipeStatus={pipeStatus} /></>);
 }

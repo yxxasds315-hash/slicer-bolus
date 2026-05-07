@@ -34,4 +34,5 @@ export type PipelineStatus = 'idle' | 'running' | 'completed' | 'error';
 export interface SlicerVolume { name: string; id: string; dimensions: number[]; spacing_mm: number[]; has_image: boolean; }
 export interface SlicerSegmentation { name: string; id: string; segments: string[]; }
 export interface SlicerRoi { name: string; id: string; center: number[]; radius: number[]; }
-export interface SlicerState { volumes: SlicerVolume[]; segmentations: SlicerSegmentation[]; rois?: SlicerRoi[]; nodes_total: number; scene_modified: boolean; error?: string; }
+export interface SlicerModel { name: string; id: string; vertices: number; }
+export interface SlicerState { volumes: SlicerVolume[]; segmentations: SlicerSegmentation[]; rois?: SlicerRoi[]; models?: SlicerModel[]; nodes_total: number; scene_modified: boolean; error?: string; }

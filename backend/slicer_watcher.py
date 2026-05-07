@@ -31,6 +31,31 @@ def _safe_get_effect(widget, name):
     return effect
 
 
+def _apply_oversampling(seg_node, vol_node, factor, isotropic=True):
+    """超采样分割的内部二值标记图，提高薄壁/小孔特征的体素精度.
+
+    原理：通过 vtkSlicerSegmentationGeometryLogic 重新计算分割的参考网格几何，
+    使其间距缩小 factor 倍（如 factor=3 则体素数增加 27 倍）。
+    之后所有 Segment Editor 二元操作（Margin/Logical/Smoothing）都在高分辨率网格上运行，
+    闭曲面提取也受益于更密的采样。
+
+    参考：Slicer 官方文档 script_repository/segmentations.md
+      "Resample segmentation to higher resolution"
+    """
+    import slicer
+    geo_logic = slicer.vtkSlicerSegmentationGeometryLogic()
+    geo_logic.SetInputSegmentationNode(seg_node)
+    geo_logic.SetSourceGeometryNode(vol_node)
+    geo_logic.SetOversamplingFactor(factor)
+    geo_logic.SetIsotropicSpacing(isotropic)
+    geo_logic.CalculateOutputGeometry()
+    geo_logic.SetReferenceImageGeometryInSegmentationNode()
+    geo_logic.ResampleLabelmapsInSegmentationNode()
+    seg = seg_node.GetSegmentation()
+    seg.SetConversionParameter("Oversampling factor", str(factor))
+    to_log("info", f"  [超采样] {factor}x, isotropic={isotropic}")
+
+
 def to_log(level, msg):
     entry = json.dumps({"timestamp": time.strftime("%H:%M:%S"), "level": level, "message": msg})
     try:
@@ -41,7 +66,7 @@ def to_log(level, msg):
 
 def update_status():
     import slicer
-    s = {"volumes": [], "segmentations": [], "rois": [], "nodes_total": 0}
+    s = {"volumes": [], "segmentations": [], "rois": [], "models": [], "nodes_total": 0}
     try:
         for v in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"):
             dims = list(v.GetImageData().GetDimensions()) if v.GetImageData() else [0,0,0]
@@ -60,6 +85,10 @@ def update_status():
             s["rois"].append({"name": roi.GetName(), "id": roi.GetID(), "center": [round(c,1) for c in center], "radius": [round(r,1) for r in radius]})
 
         s["nodes_total"] = slicer.mrmlScene.GetNumberOfNodes()
+
+        for m in slicer.util.getNodesByClass("vtkMRMLModelNode"):
+            poly = m.GetPolyData()
+            s["models"].append({"name": m.GetName(), "id": m.GetID(), "vertices": poly.GetNumberOfPoints() if poly else 0})
     except Exception as e:
         s["error"] = str(e)
     try:
@@ -92,6 +121,10 @@ def execute_pipeline(config):
     if not skin_id:
         raise RuntimeError(f"未找到 {SEG['skin']} 段, 请重新运行预览步骤")
     to_log("info", f"  校验通过: {SEG['skin']} 段存在")
+
+    # 超采样：提高标记图分辨率后再做 Margin/Subtract，避免薄壁破洞
+    oversampling = d.get("oversampling", 2.0)
+    _apply_oversampling(seg_node, vol, oversampling)
 
     # Step 3: 补偿器设计 (COPY→Grow→Subtract→Intersect)
     to_log("info", f"[3/5] 补偿器设计 (thickness={d['thickness_mm']}mm)...")
@@ -156,35 +189,35 @@ def execute_pipeline(config):
         effect = _safe_get_effect(editorWidget, "Logical operators")
         effect.setParameter("Operation", "COPY")
         effect.setParameter("ModifierSegmentID", skin_id)
-        effect.onApply()
+        effect.self().onApply()
         to_log("info", "  COPY skin → bolus")
 
         effect = _safe_get_effect(editorWidget, "Margin")
         effect.setParameter("MarginSizeMm", str(BOLUS_THICKNESS))
-        effect.onApply()
+        effect.self().onApply()
         to_log("info", f"  Margin +{BOLUS_THICKNESS}mm")
 
         effect = _safe_get_effect(editorWidget, "Logical operators")
         effect.setParameter("Operation", "SUBTRACT")
         effect.setParameter("ModifierSegmentID", skin_id)
-        effect.onApply()
+        effect.self().onApply()
         to_log("info", "  SUBTRACT skin (掏空)")
 
         effect = _safe_get_effect(editorWidget, "Logical operators")
         effect.setParameter("Operation", "INTERSECT")
         effect.setParameter("ModifierSegmentID", cutter_id)
-        effect.onApply()
+        effect.self().onApply()
         to_log("info", "  INTERSECT cutter (裁切)")
 
         effect = _safe_get_effect(editorWidget, "Islands")
         effect.setParameter("Operation", "KEEP_LARGEST_ISLAND")
-        effect.onApply()
+        effect.self().onApply()
         to_log("info", "  Islands 保留最大岛")
 
         effect = _safe_get_effect(editorWidget, "Smoothing")
         effect.setParameter("SmoothingMethod", "MEDIAN")
         effect.setParameter("KernelSizeMm", "2.0")
-        effect.onApply()
+        effect.self().onApply()
         to_log("info", "  Smooth MEDIAN 2mm")
     finally:
         editorWidget.setActiveEffectByName("")
@@ -252,12 +285,14 @@ def execute_preview(config):
         effect = _safe_get_effect(editorWidget, "Threshold")
         effect.setParameter("MinimumThreshold", "-300")
         effect.setParameter("MaximumThreshold", "3000")
-        effect.onApply()
+        effect.self().onApply()
         to_log("info", "  阈值分割完成 (HU -300 ~ 3000)")
     finally:
         editorWidget.setActiveEffectByName("")
         editorWidget.setMRMLScene(None)
         slicer.mrmlScene.RemoveNode(editorNode)
+
+    _apply_oversampling(seg_node, vol, d.get("oversampling", 2.0))
 
     seg_node.CreateClosedSurfaceRepresentation()
     display = seg_node.GetDisplayNode()
@@ -328,13 +363,13 @@ def execute_finalize_preview(config):
     try:
         effect = _safe_get_effect(editorWidget, "Islands")
         effect.setParameter("Operation", "KEEP_LARGEST_ISLAND")
-        effect.onApply()
+        effect.self().onApply()
         to_log("info", "  去杂讯完成 (保留最大岛)")
 
         effect = _safe_get_effect(editorWidget, "Smoothing")
         effect.setParameter("SmoothingMethod", d.get("smoothing_method", "MEDIAN"))
         effect.setParameter("KernelSizeMm", str(d.get("smoothing_kernel_mm", 3.0)))
-        effect.onApply()
+        effect.self().onApply()
         seg_node.CreateClosedSurfaceRepresentation()
         to_log("info", f"  平滑完成")
     finally:
@@ -390,7 +425,7 @@ def execute_solidify(config):
         eff = _safe_get_effect(editorWidget, name)
         for k, v in params.items():
             eff.setParameter(k, v)
-        eff.onApply()
+        eff.self().onApply()
 
     try:
         to_log("info", "[1/4] 形态学闭合 — 密封气道开口...")
@@ -464,7 +499,7 @@ def execute_seal(config):
         eff = _safe_get_effect(editorWidget, name)
         for k, v in params.items():
             eff.setParameter(k, v)
-        eff.onApply()
+        eff.self().onApply()
 
     try:
         # 第一次：大核封耳道（管道纵深长，需要更大核）
@@ -580,23 +615,31 @@ def _poly_boolean(poly_a, poly_b, operation):
 def _apply_margin_to_segment(seg_node, segment_name, margin_mm, new_name):
     seg = seg_node.GetSegmentation()
     src_id = seg.GetSegmentIdBySegmentName(segment_name)
-    new_id = seg.AddEmptySegment(new_name)
-    seg.CopySegment(new_id, src_id)
-    to_log("info", f"  [复制] {segment_name} → {new_name}")
+    new_id = seg.AddEmptySegment(new_name, new_name)
     ref_volume = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
     if ref_volume is None:
         raise RuntimeError("场景中无体积数据，无法执行 Margin 膨胀。请先完成 DICOM 加载和预览分割。")
     seg_editor_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentEditorNode")
+    seg_editor_node.SetOverwriteMode(slicer.vtkMRMLSegmentEditorNode.OverwriteNone)
     seg_editor_widget = slicer.qMRMLSegmentEditorWidget()
     seg_editor_widget.setMRMLScene(slicer.mrmlScene)
     seg_editor_widget.setMRMLSegmentEditorNode(seg_editor_node)
     seg_editor_widget.setSegmentationNode(seg_node)
     seg_editor_widget.setSourceVolumeNode(ref_volume)
     seg_editor_node.SetSelectedSegmentID(new_id)
+    # 确保 binary labelmap 为主表示，COPY 依赖它
+    seg.CreateRepresentation(slicer.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName())
     try:
+        # 用 Logical operators COPY 复制源段（避免 seg.CopySegment 兼容性问题）
+        effect = _safe_get_effect(seg_editor_widget, "Logical operators")
+        effect.setParameter("Operation", "COPY")
+        effect.setParameter("ModifierSegmentID", src_id)
+        effect.self().onApply()
+        to_log("info", f"  [复制] {segment_name} → {new_name}")
+
         effect = _safe_get_effect(seg_editor_widget, "Margin")
         effect.setParameter("MarginSizeMm", str(margin_mm))
-        effect.onApply()
+        effect.self().onApply()
         to_log("info", f"  [Margin +{margin_mm}mm] 完成")
     finally:
         seg_editor_widget.setActiveEffectByName("")
@@ -636,25 +679,66 @@ def _make_box_poly(cx, cy, cz, sx, sy, sz):
 
 
 def _add_model_to_scene(poly, name, color=(0.8, 0.5, 0.3), opacity=0.7):
+    if poly.GetNumberOfPoints() == 0:
+        to_log("warning", f"  [显示] {name} 跳过 — 无顶点数据")
+        return None
     node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", name)
     node.SetAndObservePolyData(poly)
     disp = node.CreateDefaultDisplayNodes()
-    disp.SetColor(*color)
-    disp.SetOpacity(opacity)
+    if disp:
+        disp.SetColor(*color)
+        disp.SetOpacity(opacity)
     to_log("info", f"  [显示] {name} → 3D 视图")
     return node
 
 
 def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm):
+    """阴模：通过 Segment Editor 二元操作生成薄壳，避免 VTK polydata 布尔重合面问题"""
     to_log("info", "── 阴模生成 ──")
-    bolus_poly = _get_segment_polydata(seg_node, bolus_name)
+    seg = seg_node.GetSegmentation()
+    bolus_id = seg.GetSegmentIdBySegmentName(bolus_name)
+
+    # 1. 膨胀 bolus 得到外层
     _apply_margin_to_segment(seg_node, bolus_name, shell_mm, SEG["temp_bolus_expanded"])
-    expanded_poly = _get_segment_polydata(seg_node, SEG["temp_bolus_expanded"])
-    shell = _poly_boolean(expanded_poly, bolus_poly, "difference")
-    skin_poly = _get_segment_polydata(seg_node, skin_name)
-    female = _poly_boolean(shell, skin_poly, "difference")
-    to_log("info", f"  [阴模] {female.GetNumberOfPoints():,} pts")
-    return female
+
+    # 2. 复制膨胀结果到阴模段，再减去原始 bolus → 得到 4mm 薄壳
+    expanded_id = seg.GetSegmentIdBySegmentName(SEG["temp_bolus_expanded"])
+    female_name = "Mold_Female"
+    female_id = seg.AddEmptySegment(female_name, female_name)
+    ref_volume = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
+
+    en = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentEditorNode")
+    en.SetOverwriteMode(slicer.vtkMRMLSegmentEditorNode.OverwriteNone)
+    ew = slicer.qMRMLSegmentEditorWidget()
+    ew.setMRMLScene(slicer.mrmlScene)
+    ew.setMRMLSegmentEditorNode(en)
+    ew.setSegmentationNode(seg_node)
+    ew.setSourceVolumeNode(ref_volume)
+    en.SetSelectedSegmentID(female_id)
+    seg.CreateRepresentation(slicer.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName())
+
+    try:
+        # COPY expanded → female
+        eff = _safe_get_effect(ew, "Logical operators")
+        eff.setParameter("Operation", "COPY")
+        eff.setParameter("ModifierSegmentID", expanded_id)
+        eff.self().onApply()
+        to_log("info", f"  [复制] → {female_name}")
+
+        # SUBTRACT bolus → 得到 4mm 壳体
+        eff = _safe_get_effect(ew, "Logical operators")
+        eff.setParameter("Operation", "SUBTRACT")
+        eff.setParameter("ModifierSegmentID", bolus_id)
+        eff.self().onApply()
+        to_log("info", f"  [掏空] 减去 bolus → {shell_mm}mm 壳体")
+    finally:
+        ew.setActiveEffectByName("")
+        ew.setMRMLScene(None)
+        slicer.mrmlScene.RemoveNode(en)
+
+    female_poly = _get_segment_polydata(seg_node, female_name)
+    to_log("info", f"  [阴模] {female_poly.GetNumberOfPoints():,} pts")
+    return female_poly
 
 
 def _make_male_mold(seg_node, bolus_name, skin_name, skin_padding_mm, base_thickness_mm):
@@ -671,10 +755,20 @@ def _make_male_mold(seg_node, bolus_name, skin_name, skin_padding_mm, base_thick
     cz = b[4] - bz / 2 + 10
     clip_box = _make_box_poly(cx, cy, cz, bx, by, bz)
     skin_region = _poly_boolean(skin_poly, clip_box, "intersection")
+    if skin_region.GetNumberOfPoints() == 0:
+        to_log("warning", "  skin_region 为空，回退到原始皮肤表面")
+        skin_region = skin_poly
+
     sb = skin_region.GetBounds()
     z_bot = sb[4]
     base = _make_box_poly(cx, cy, z_bot - base_thickness_mm / 2, bx, by, base_thickness_mm)
-    male = _poly_boolean(skin_region, base, "union")
+
+    # 用 vtkAppendPolyData 拼接，避免 vtkBooleanOperationPolyDataFilter 的 union 失败
+    append_filter = vtk.vtkAppendPolyData()
+    append_filter.AddInputData(skin_region)
+    append_filter.AddInputData(base)
+    append_filter.Update()
+    male = append_filter.GetOutput()
     to_log("info", f"  [阳模] {male.GetNumberOfPoints():,} pts")
     return male
 
@@ -736,6 +830,10 @@ def execute_mold(config):
     if not seg.GetSegmentIdBySegmentName(SEG["skin"]):
         raise RuntimeError(f"未找到 '{SEG['skin']}' 段，请先完成预览分割")
 
+    vol = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
+    if vol:
+        _apply_oversampling(seg_node, vol, d.get("oversampling", 2.0))
+
     shell_mm = d.get("mold_shell_thickness_mm", 4.0)
     base_mm = d.get("mold_base_thickness_mm", 2.5)
     skin_pad_mm = d.get("mold_skin_padding_mm", 6.0)
@@ -754,9 +852,10 @@ def execute_mold(config):
     _add_model_to_scene(male, "Mold_Male_Base", color=(0.36, 0.55, 0.93), opacity=0.75)
 
     # 清理临时 segment
-    tmp_id = seg.GetSegmentIdBySegmentName(SEG["temp_bolus_expanded"])
-    if tmp_id:
-        seg.RemoveSegment(tmp_id)
+    for tmp_name in [SEG["temp_bolus_expanded"], "Mold_Female"]:
+        tmp_id = seg.GetSegmentIdBySegmentName(tmp_name)
+        if tmp_id:
+            seg.RemoveSegment(tmp_id)
 
     to_log("success", "模具生成完成 — Mold_Female_Conformal（橙色）+ Mold_Male_Base（蓝色）")
 

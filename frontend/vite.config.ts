@@ -12,17 +12,22 @@ function slicerLauncherPlugin() {
     configureServer(server: any) {
       server.middlewares.use('/api/launch', (_req: any, res: any) => {
         res.writeHead(200, { 'Content-Type': 'text/plain' })
-        res.write('Starting 3D Slicer...\n')
-        const proc = spawn('bash', [launchScript], {
-          detached: true,
-          stdio: ['ignore', 'pipe', 'pipe'],
-        })
-        proc.stdout.on('data', (d: Buffer) => res.write(d))
-        proc.stderr.on('data', (d: Buffer) => res.write(d))
-        proc.on('close', () => res.end('\nSlicer exited'))
-        proc.on('error', () => {
-          res.write('\nFailed: Slicer not found at /Applications/Slicer.app')
-          res.end()
+        res.write('准备启动 3D Slicer...\n')
+        // 先杀掉可能已在运行但未加载脚本的 Slicer
+        const kill = spawn('pkill', ['-f', '/Applications/Slicer.app/Contents/MacOS/Slicer'], { stdio: 'ignore' })
+        kill.on('close', () => {
+          res.write('正在启动（请等待约 15 秒）...\n')
+          const proc = spawn('bash', [launchScript], {
+            detached: true,
+            stdio: ['ignore', 'pipe', 'pipe'],
+          })
+          proc.stdout.on('data', (d: Buffer) => res.write(d))
+          proc.stderr.on('data', (d: Buffer) => res.write(d))
+          proc.on('close', () => res.end('\nSlicer exited'))
+          proc.on('error', () => {
+            res.write('\nFailed: Slicer not found at /Applications/Slicer.app')
+            res.end()
+          })
         })
       })
 
