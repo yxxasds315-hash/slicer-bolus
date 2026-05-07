@@ -154,6 +154,7 @@ def execute_pipeline(config):
     editorWidget.setMRMLScene(slicer.mrmlScene)
     editorWidget.setMRMLSegmentEditorNode(editorNode)
     editorWidget.setSegmentationNode(seg_node)
+    editorWidget.setSourceVolumeNode(vol)
     editorNode.SetOverwriteMode(slicer.vtkMRMLSegmentEditorNode.OverwriteNone)
     editorNode.SetSelectedSegmentID(bolus_id)
 
