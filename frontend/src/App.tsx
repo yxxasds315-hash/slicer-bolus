@@ -35,6 +35,7 @@ const defaultConfig: PipelineConfig = {
 type ConnStatus = 'checking' | 'online' | 'offline' | 'no_watcher' | 'launching';
 
 export default function App() {
+  const devMode = new URLSearchParams(window.location.search).has('dev');
   const [config, setConfig] = useState<PipelineConfig>(defaultConfig);
   const [step, setStep] = useState(1);
   const [pipeStatus, setPipeStatus] = useState<PipelineStatus>('idle');
@@ -83,6 +84,7 @@ export default function App() {
   const updateConfig = useCallback((p: Partial<PipelineConfig>) => setConfig((prev) => ({ ...prev, ...p })), []);
 
   const canNext = () => {
+    if (devMode) return true;
     switch (step) {
       case 1: return config.dicom_dir.trim().length > 0 || slicer.volumes.length > 0;
       case 2: return previewStatus === 'done';
@@ -139,5 +141,5 @@ export default function App() {
     return (<><div className="min-h-screen flex items-center justify-center bg-medical-900 pb-12"><div className="wizard-card w-full max-w-md p-8 text-center"><h1 className="text-2xl font-bold text-accent-200 mb-2">Bolus Designer</h1><p className="text-medical-500 text-sm mb-8">放疗个性化补偿器数字化设计平台</p><div className="mb-6">{isSpinning ? <div className="animate-spin inline-block w-8 h-8 border-2 border-accent-400 border-t-transparent rounded-full" /> : isNoWatcher ? <div className="text-5xl mb-3">⚠️</div> : <div className="text-5xl mb-3">🔬</div>}<p className={`text-sm mt-3 ${isNoWatcher ? 'text-warning font-medium' : 'text-medical-400'}`}>{statusText}</p>{isNoWatcher && <p className="text-xs text-medical-500 mt-2">Slicer 进程已运行，但未通过 --python-script 加载桥接脚本。<br/>点击下方按钮自动修复（关闭并重启 Slicer）。</p>}</div><button onClick={launchSlicer} disabled={conn === 'launching' || conn === 'checking'} className="btn-primary w-full mb-3 text-base">{conn === 'launching' ? '启动中...' : isNoWatcher ? '🔧 自动修复并重启 Slicer' : '🚀 启动 3D Slicer'}</button>{launchLog && <div className="log-stream mt-4 text-left"><pre className="text-xs text-gray-300 whitespace-pre-wrap">{launchLog}</pre></div>}</div></div><SlicerMonitor slicer={slicer} slicerOnline={slicerOnline} logs={logs} pipeStatus={pipeStatus} /></>);
   }
 
-  return (<><WizardLayout currentStep={step} totalSteps={8} onNext={handleNext} onPrev={handlePrev} canNext={canNext()} isLast={step === 8} status={pipeStatus} slicer={slicer} slicerOnline={slicerOnline} onReconnect={launchSlicer} connecting={conn === 'launching'} onJumpToStep={handleJumpToStep}>{renderStep()}</WizardLayout><SlicerMonitor slicer={slicer} slicerOnline={slicerOnline} logs={logs} pipeStatus={pipeStatus} /></>);
+  return (<><WizardLayout currentStep={step} totalSteps={8} onNext={handleNext} onPrev={handlePrev} canNext={canNext()} isLast={step === 8} status={pipeStatus} slicer={slicer} slicerOnline={slicerOnline} onReconnect={launchSlicer} connecting={conn === 'launching'} onJumpToStep={handleJumpToStep} devMode={devMode}>{renderStep()}</WizardLayout><SlicerMonitor slicer={slicer} slicerOnline={slicerOnline} logs={logs} pipeStatus={pipeStatus} /></>);
 }
