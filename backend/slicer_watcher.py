@@ -22,6 +22,15 @@ def _bolus_name(thickness_mm: float) -> str:
     return f"Bolus_{thickness_mm}mm"
 
 
+def _safe_get_effect(widget, name):
+    """安全获取 SegmentEditor 效果，失败时抛出明确错误"""
+    widget.setActiveEffectByName(name)
+    effect = widget.activeEffect()
+    if not effect:
+        raise RuntimeError(f"'{name}' 效果不可用，请确认 Slicer SegmentEditor 模块已加载")
+    return effect
+
+
 def to_log(level, msg):
     entry = json.dumps({"timestamp": time.strftime("%H:%M:%S"), "level": level, "message": msg})
     try:
@@ -93,10 +102,13 @@ def execute_pipeline(config):
     old_bolus = seg.GetSegmentIdBySegmentName(bolus_name)
     if old_bolus:
         seg.RemoveSegment(old_bolus)
-    bolus_id = seg.AddEmptySegment(bolus_name, bolus_name, [0.2, 0.6, 0.9])
+    bolus_id = seg.AddEmptySegment(bolus_name, bolus_name, (0.2, 0.6, 0.9))
 
     roi_nodes = slicer.util.getNodesByClass("vtkMRMLMarkupsROINode")
-    if roi_nodes:
+    roi_mode = d.get("roi_mode", "full_skin")
+    if roi_mode == "slicer_roi":
+        if not roi_nodes:
+            raise RuntimeError("ROI 模式为 'slicer_roi' 但未检测到 Markups ROI 节点。请返回第 3 步在 Slicer 中创建 ROI，或切换为「全部皮肤」模式。")
         roi = roi_nodes[0]
         to_log("info", f"  使用 ROI: {roi.GetName()}")
         bounds = [0]*6
@@ -108,6 +120,8 @@ def execute_pipeline(config):
         if skin_poly.GetNumberOfPoints() == 0:
             seg_node.CreateClosedSurfaceRepresentation()
             seg_node.GetClosedSurfaceRepresentation(skin_id, skin_poly)
+        if skin_poly.GetNumberOfPoints() == 0:
+            raise RuntimeError("皮肤表面数据为空，无法获取边界。请确认分割结果有效并已生成 3D 表面表示。")
         bounds = [0]*6
         skin_poly.GetBounds(bounds)
 
@@ -138,43 +152,44 @@ def execute_pipeline(config):
     editorNode.SetOverwriteMode(slicer.vtkMRMLSegmentEditorNode.OverwriteNone)
     editorNode.SetSelectedSegmentID(bolus_id)
 
-    editorWidget.setActiveEffectByName("Logical operators")
-    editorWidget.activeEffect().setParameter("Operation", "COPY")
-    editorWidget.activeEffect().setParameter("ModifierSegmentID", skin_id)
-    editorWidget.activeEffect().self().onApply()
-    to_log("info", "  COPY skin → bolus")
+    try:
+        effect = _safe_get_effect(editorWidget, "Logical operators")
+        effect.setParameter("Operation", "COPY")
+        effect.setParameter("ModifierSegmentID", skin_id)
+        effect.onApply()
+        to_log("info", "  COPY skin → bolus")
 
-    editorWidget.setActiveEffectByName("Margin")
-    editorWidget.activeEffect().setParameter("MarginSizeMm", str(BOLUS_THICKNESS))
-    editorWidget.activeEffect().self().onApply()
-    to_log("info", f"  Margin +{BOLUS_THICKNESS}mm")
+        effect = _safe_get_effect(editorWidget, "Margin")
+        effect.setParameter("MarginSizeMm", str(BOLUS_THICKNESS))
+        effect.onApply()
+        to_log("info", f"  Margin +{BOLUS_THICKNESS}mm")
 
-    editorWidget.setActiveEffectByName("Logical operators")
-    editorWidget.activeEffect().setParameter("Operation", "SUBTRACT")
-    editorWidget.activeEffect().setParameter("ModifierSegmentID", skin_id)
-    editorWidget.activeEffect().self().onApply()
-    to_log("info", "  SUBTRACT skin (掏空)")
+        effect = _safe_get_effect(editorWidget, "Logical operators")
+        effect.setParameter("Operation", "SUBTRACT")
+        effect.setParameter("ModifierSegmentID", skin_id)
+        effect.onApply()
+        to_log("info", "  SUBTRACT skin (掏空)")
 
-    editorWidget.setActiveEffectByName("Logical operators")
-    editorWidget.activeEffect().setParameter("Operation", "INTERSECT")
-    editorWidget.activeEffect().setParameter("ModifierSegmentID", cutter_id)
-    editorWidget.activeEffect().self().onApply()
-    to_log("info", "  INTERSECT cutter (裁切)")
+        effect = _safe_get_effect(editorWidget, "Logical operators")
+        effect.setParameter("Operation", "INTERSECT")
+        effect.setParameter("ModifierSegmentID", cutter_id)
+        effect.onApply()
+        to_log("info", "  INTERSECT cutter (裁切)")
 
-    editorWidget.setActiveEffectByName("Islands")
-    editorWidget.activeEffect().setParameter("Operation", "KEEP_LARGEST_ISLAND")
-    editorWidget.activeEffect().self().onApply()
-    to_log("info", "  Islands 保留最大岛")
+        effect = _safe_get_effect(editorWidget, "Islands")
+        effect.setParameter("Operation", "KEEP_LARGEST_ISLAND")
+        effect.onApply()
+        to_log("info", "  Islands 保留最大岛")
 
-    editorWidget.setActiveEffectByName("Smoothing")
-    editorWidget.activeEffect().setParameter("SmoothingMethod", "MEDIAN")
-    editorWidget.activeEffect().setParameter("KernelSizeMm", "2.0")
-    editorWidget.activeEffect().self().onApply()
-    to_log("info", "  Smooth MEDIAN 2mm")
-
-    editorWidget.setActiveEffectByName("")
-    editorWidget.setMRMLScene(None)
-    slicer.mrmlScene.RemoveNode(editorNode)
+        effect = _safe_get_effect(editorWidget, "Smoothing")
+        effect.setParameter("SmoothingMethod", "MEDIAN")
+        effect.setParameter("KernelSizeMm", "2.0")
+        effect.onApply()
+        to_log("info", "  Smooth MEDIAN 2mm")
+    finally:
+        editorWidget.setActiveEffectByName("")
+        editorWidget.setMRMLScene(None)
+        slicer.mrmlScene.RemoveNode(editorNode)
 
     seg.RemoveSegment(cutter_id)
     seg_node.CreateClosedSurfaceRepresentation()
@@ -222,7 +237,7 @@ def execute_preview(config):
     seg_node.CreateDefaultDisplayNodes()
     seg_node.SetReferenceImageGeometryParameterFromVolumeNode(vol)
 
-    skin_id = seg_node.GetSegmentation().AddEmptySegment(SEG["skin"], SEG["skin"], [0.2, 0.8, 0.3])
+    skin_id = seg_node.GetSegmentation().AddEmptySegment(SEG["skin"], SEG["skin"], (0.2, 0.8, 0.3))
     seg = seg_node.GetSegmentation()
 
     editorNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentEditorNode")
@@ -233,16 +248,16 @@ def execute_preview(config):
     editorWidget.setSourceVolumeNode(vol)
     editorNode.SetSelectedSegmentID(skin_id)
 
-    editorWidget.setActiveEffectByName("Threshold")
-    effect = editorWidget.activeEffect()
-    effect.setParameter("MinimumThreshold", "-300")
-    effect.setParameter("MaximumThreshold", "3000")
-    effect.self().onApply()
-    to_log("info", "  阈值分割完成 (HU -300 ~ 3000)")
-
-    editorWidget.setActiveEffectByName("")
-    editorWidget.setMRMLScene(None)
-    slicer.mrmlScene.RemoveNode(editorNode)
+    try:
+        effect = _safe_get_effect(editorWidget, "Threshold")
+        effect.setParameter("MinimumThreshold", "-300")
+        effect.setParameter("MaximumThreshold", "3000")
+        effect.onApply()
+        to_log("info", "  阈值分割完成 (HU -300 ~ 3000)")
+    finally:
+        editorWidget.setActiveEffectByName("")
+        editorWidget.setMRMLScene(None)
+        slicer.mrmlScene.RemoveNode(editorNode)
 
     seg_node.CreateClosedSurfaceRepresentation()
     display = seg_node.GetDisplayNode()
@@ -251,7 +266,7 @@ def execute_preview(config):
     lm = slicer.app.layoutManager()
     for dv in range(lm.threeDViewCount):
         lm.threeDWidget(dv).threeDView().resetFocalPoint()
-    to_log("success", "[2/2] 阈值初筛完成 — 请检查是否需要剪裁床板")
+    to_log("success", "阈值初筛完成 — 请检查是否需要剪裁床板")
 
     return [{"node": seg_node.GetID(), "name": seg_node.GetName(), "skin_segment": skin_id}]
 
@@ -310,23 +325,22 @@ def execute_finalize_preview(config):
     editorWidget.setSegmentationNode(seg_node)
     editorNode.SetSelectedSegmentID(skin_id)
 
-    editorWidget.setActiveEffectByName("Islands")
-    effect = editorWidget.activeEffect()
-    effect.setParameter("Operation", "KEEP_LARGEST_ISLAND")
-    effect.self().onApply()
-    to_log("info", "  去杂讯完成 (保留最大岛)")
+    try:
+        effect = _safe_get_effect(editorWidget, "Islands")
+        effect.setParameter("Operation", "KEEP_LARGEST_ISLAND")
+        effect.onApply()
+        to_log("info", "  去杂讯完成 (保留最大岛)")
 
-    editorWidget.setActiveEffectByName("Smoothing")
-    effect = editorWidget.activeEffect()
-    effect.setParameter("SmoothingMethod", d.get("smoothing_method", "MEDIAN"))
-    effect.setParameter("KernelSizeMm", str(d.get("smoothing_kernel_mm", 3.0)))
-    effect.self().onApply()
-    seg_node.CreateClosedSurfaceRepresentation()
-    to_log("info", f"  平滑完成")
-
-    editorWidget.setActiveEffectByName("")
-    editorWidget.setMRMLScene(None)
-    slicer.mrmlScene.RemoveNode(editorNode)
+        effect = _safe_get_effect(editorWidget, "Smoothing")
+        effect.setParameter("SmoothingMethod", d.get("smoothing_method", "MEDIAN"))
+        effect.setParameter("KernelSizeMm", str(d.get("smoothing_kernel_mm", 3.0)))
+        effect.onApply()
+        seg_node.CreateClosedSurfaceRepresentation()
+        to_log("info", f"  平滑完成")
+    finally:
+        editorWidget.setActiveEffectByName("")
+        editorWidget.setMRMLScene(None)
+        slicer.mrmlScene.RemoveNode(editorNode)
 
     try:
         med = slicer.modules.segmenteditor.widgetRepresentation().self().editor
@@ -373,42 +387,42 @@ def execute_solidify(config):
     editorNode.SetSelectedSegmentID(skin_id)
 
     def apply_effect(name, params: dict):
-        editorWidget.setActiveEffectByName(name)
-        eff = editorWidget.activeEffect()
+        eff = _safe_get_effect(editorWidget, name)
         for k, v in params.items():
             eff.setParameter(k, v)
-        eff.self().onApply()
+        eff.onApply()
 
-    to_log("info", "[1/4] 形态学闭合 — 密封气道开口...")
-    apply_effect("Smoothing", {
-        "SmoothingMethod": "MORPHOLOGICAL_CLOSING",
-        "KernelSizeMm": "6.0",
-    })
+    try:
+        to_log("info", "[1/4] 形态学闭合 — 密封气道开口...")
+        apply_effect("Smoothing", {
+            "SmoothingMethod": "MORPHOLOGICAL_CLOSING",
+            "KernelSizeMm": "6.0",
+        })
 
-    to_log("info", "[2/4] 构建外部空气掩膜...")
-    AIR_NAME = SEG["temp_air"]
-    existing_air_id = seg.GetSegmentIdBySegmentName(AIR_NAME)
-    if existing_air_id:
-        seg.RemoveSegment(existing_air_id)
+        to_log("info", "[2/4] 构建外部空气掩膜...")
+        AIR_NAME = SEG["temp_air"]
+        existing_air_id = seg.GetSegmentIdBySegmentName(AIR_NAME)
+        if existing_air_id:
+            seg.RemoveSegment(existing_air_id)
 
-    air_id = seg.AddEmptySegment(AIR_NAME, AIR_NAME)
-    editorNode.SetSelectedSegmentID(air_id)
+        air_id = seg.AddEmptySegment(AIR_NAME, AIR_NAME)
+        editorNode.SetSelectedSegmentID(air_id)
 
-    apply_effect("Logical operators", {"Operation": "COPY", "ModifierSegmentID": skin_id})
-    apply_effect("Logical operators", {"Operation": "INVERT", "ModifierSegmentID": ""})
+        apply_effect("Logical operators", {"Operation": "COPY", "ModifierSegmentID": skin_id})
+        apply_effect("Logical operators", {"Operation": "INVERT", "ModifierSegmentID": ""})
 
-    to_log("info", "[3/4] 移除内部空腔 (气管/鼻窦/肺)...")
-    apply_effect("Islands", {"Operation": "KEEP_LARGEST_ISLAND"})
+        to_log("info", "[3/4] 移除内部空腔 (气管/鼻窦/肺)...")
+        apply_effect("Islands", {"Operation": "KEEP_LARGEST_ISLAND"})
 
-    to_log("info", "[4/4] 最终反转 — 铸造实心体...")
-    editorNode.SetSelectedSegmentID(skin_id)
-    apply_effect("Logical operators", {"Operation": "COPY", "ModifierSegmentID": air_id})
-    apply_effect("Logical operators", {"Operation": "INVERT", "ModifierSegmentID": ""})
-
-    editorWidget.setActiveEffectByName("")
-    slicer.mrmlScene.RemoveNode(editorNode)
-    editorWidget.setMRMLScene(None)
-    seg.RemoveSegment(air_id)
+        to_log("info", "[4/4] 最终反转 — 铸造实心体...")
+        editorNode.SetSelectedSegmentID(skin_id)
+        apply_effect("Logical operators", {"Operation": "COPY", "ModifierSegmentID": air_id})
+        apply_effect("Logical operators", {"Operation": "INVERT", "ModifierSegmentID": ""})
+    finally:
+        editorWidget.setActiveEffectByName("")
+        slicer.mrmlScene.RemoveNode(editorNode)
+        editorWidget.setMRMLScene(None)
+        seg.RemoveSegment(air_id)
 
     seg_node.CreateClosedSurfaceRepresentation()
     to_log("success", "实心化完成 — 所有内部空腔已填充, 身体为完整实心体")
@@ -447,29 +461,29 @@ def execute_seal(config):
     editorWidget.setSourceVolumeNode(vol)
 
     def apply_effect(name, params: dict):
-        editorWidget.setActiveEffectByName(name)
-        eff = editorWidget.activeEffect()
+        eff = _safe_get_effect(editorWidget, name)
         for k, v in params.items():
             eff.setParameter(k, v)
-        eff.self().onApply()
+        eff.onApply()
 
-    # 第一次：大核封耳道（管道纵深长，需要更大核）
-    to_log("info", f"[1/2] 大核封耳道 — MORPHOLOGICAL_CLOSING {k1}mm")
-    apply_effect("Smoothing", {
-        "SmoothingMethod": "MORPHOLOGICAL_CLOSING",
-        "KernelSizeMm": str(k1),
-    })
+    try:
+        # 第一次：大核封耳道（管道纵深长，需要更大核）
+        to_log("info", f"[1/2] 大核封耳道 — MORPHOLOGICAL_CLOSING {k1}mm")
+        apply_effect("Smoothing", {
+            "SmoothingMethod": "MORPHOLOGICAL_CLOSING",
+            "KernelSizeMm": str(k1),
+        })
 
-    # 第二次：中核补鼻孔（避免过大核破坏鼻尖轮廓）
-    to_log("info", f"[2/2] 中核补鼻孔 — MORPHOLOGICAL_CLOSING {k2}mm")
-    apply_effect("Smoothing", {
-        "SmoothingMethod": "MORPHOLOGICAL_CLOSING",
-        "KernelSizeMm": str(k2),
-    })
-
-    editorWidget.setActiveEffectByName("")
-    editorWidget.setMRMLScene(None)
-    slicer.mrmlScene.RemoveNode(editorNode)
+        # 第二次：中核补鼻孔（避免过大核破坏鼻尖轮廓）
+        to_log("info", f"[2/2] 中核补鼻孔 — MORPHOLOGICAL_CLOSING {k2}mm")
+        apply_effect("Smoothing", {
+            "SmoothingMethod": "MORPHOLOGICAL_CLOSING",
+            "KernelSizeMm": str(k2),
+        })
+    finally:
+        editorWidget.setActiveEffectByName("")
+        editorWidget.setMRMLScene(None)
+        slicer.mrmlScene.RemoveNode(editorNode)
 
     seg_node.CreateClosedSurfaceRepresentation()
     to_log("success", f"二次封口完成 — 大核{k1}mm + 中核{k2}mm, 请在 Slicer 中检查鼻孔/耳道")
@@ -579,14 +593,15 @@ def _apply_margin_to_segment(seg_node, segment_name, margin_mm, new_name):
     seg_editor_widget.setSegmentationNode(seg_node)
     seg_editor_widget.setSourceVolumeNode(ref_volume)
     seg_editor_node.SetSelectedSegmentID(new_id)
-    seg_editor_widget.setActiveEffectByName("Margin")
-    effect = seg_editor_widget.activeEffect()
-    effect.setParameter("MarginSizeMm", str(margin_mm))
-    effect.self().onApply()
-    to_log("info", f"  [Margin +{margin_mm}mm] 完成")
-    seg_editor_widget.setActiveEffectByName("")
-    seg_editor_widget.setMRMLScene(None)
-    slicer.mrmlScene.RemoveNode(seg_editor_node)
+    try:
+        effect = _safe_get_effect(seg_editor_widget, "Margin")
+        effect.setParameter("MarginSizeMm", str(margin_mm))
+        effect.onApply()
+        to_log("info", f"  [Margin +{margin_mm}mm] 完成")
+    finally:
+        seg_editor_widget.setActiveEffectByName("")
+        seg_editor_widget.setMRMLScene(None)
+        slicer.mrmlScene.RemoveNode(seg_editor_node)
     return new_id
 
 
@@ -730,8 +745,8 @@ def execute_mold(config):
     sprue_r = d.get("mold_sprue_radius_mm", 3.0)
     vent_r = d.get("mold_vent_radius_mm", 1.0)
 
-    female = _make_female_mold(seg_node, bolus_name, skin_name, shell_mm)
-    male = _make_male_mold(seg_node, bolus_name, skin_name, skin_pad_mm, base_mm)
+    female = _make_female_mold(seg_node, bolus_name, SEG["skin"], shell_mm)
+    male = _make_male_mold(seg_node, bolus_name, SEG["skin"], skin_pad_mm, base_mm)
     female, male = _add_pins(female, male, pin_r, pin_h, pin_clr)
     female = _add_sprue_and_vents(female, sprue_r, vent_r)
 
