@@ -14,8 +14,8 @@ function detectCompletedSteps(slicer?: SlicerState): Set<number> {
   if (slicer.volumes.length > 0) done.add(1);
   const allSegs = slicer.segmentations.flatMap(s => s.segments);
   if (allSegs.includes('Skin')) done.add(2);
-  if (allSegs.some(s => /^Bolus_\d+mm$/.test(s))) done.add(6);
-  if (slicer.models?.some(m => m.name === 'Mold_Female_Conformal')) done.add(7);
+  if (allSegs.some(s => /^Bolus_\d+mm$/.test(s))) done.add(5);
+  if (slicer.models?.some(m => m.name === 'Mold_Female_Conformal')) done.add(6);
   return done;
 }
 
@@ -28,7 +28,7 @@ function getJumpTarget(done: Set<number>, current: number): { step: number; labe
 }
 
 export function WizardLayout({ children, currentStep, totalSteps: _ts, onNext, onPrev, canNext, isLast, status, slicer, slicerOnline, onReconnect, connecting, onJumpToStep, devMode }: WizardLayoutProps) {
-  const steps = [{ id: 1, label: 'DICOM 加载', icon: '📁' },{ id: 2, label: '皮肤分割', icon: '🔪' },{ id: 3, label: 'ROI 选择', icon: '🎯' },{ id: 4, label: '补偿器设计', icon: '🔧' },{ id: 5, label: '导出设置', icon: '📤' },{ id: 6, label: '执行', icon: '▶' },{ id: 7, label: '模具设计', icon: '🧱' },{ id: 8, label: '导出 STL', icon: '💾' }];
+  const steps = [{ id: 1, label: 'DICOM 加载', icon: '📁' },{ id: 2, label: '皮肤分割', icon: '🔪' },{ id: 3, label: 'ROI 选择', icon: '🎯' },{ id: 4, label: '补偿器设计', icon: '🔧' },{ id: 5, label: '执行', icon: '▶' },{ id: 6, label: '模具设计', icon: '🧱' },{ id: 7, label: '导出 STL', icon: '💾' }];
   const totalSteps = _ts || steps.length;
   return (
     <div className="min-h-screen flex flex-col items-center py-8 px-4 pb-16">
