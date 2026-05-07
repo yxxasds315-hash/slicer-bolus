@@ -680,52 +680,16 @@ def _add_model_to_scene(poly, name, color=(0.8, 0.5, 0.3), opacity=0.7):
 
 
 def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm):
-    """阴模：通过 Segment Editor 二元操作生成薄壳，避免 VTK polydata 布尔重合面问题"""
+    """阴模：膨胀 bolus → expanded - bolus = 壳体 → 壳体 - skin = 阴模"""
     to_log("info", "── 阴模生成 ──")
-    seg = seg_node.GetSegmentation()
-    bolus_id = seg.GetSegmentIdBySegmentName(bolus_name)
-
-    # 1. 膨胀 bolus 得到外层
+    bolus_poly = _get_segment_polydata(seg_node, bolus_name)
     _apply_margin_to_segment(seg_node, bolus_name, shell_mm, SEG["temp_bolus_expanded"])
-
-    # 2. 复制膨胀结果到阴模段，再减去原始 bolus → 得到 4mm 薄壳
-    expanded_id = seg.GetSegmentIdBySegmentName(SEG["temp_bolus_expanded"])
-    female_name = "Mold_Female"
-    female_id = seg.AddEmptySegment(female_name, female_name)
-    ref_volume = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
-
-    en = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentEditorNode")
-    en.SetOverwriteMode(slicer.vtkMRMLSegmentEditorNode.OverwriteNone)
-    ew = slicer.qMRMLSegmentEditorWidget()
-    ew.setMRMLScene(slicer.mrmlScene)
-    ew.setMRMLSegmentEditorNode(en)
-    ew.setSegmentationNode(seg_node)
-    ew.setSourceVolumeNode(ref_volume)
-    en.SetSelectedSegmentID(female_id)
-    seg.CreateRepresentation(slicer.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName())
-
-    try:
-        # COPY expanded → female
-        eff = _safe_get_effect(ew, "Logical operators")
-        eff.setParameter("Operation", "COPY")
-        eff.setParameter("ModifierSegmentID", expanded_id)
-        eff.self().onApply()
-        to_log("info", f"  [复制] → {female_name}")
-
-        # SUBTRACT bolus → 得到 4mm 壳体
-        eff = _safe_get_effect(ew, "Logical operators")
-        eff.setParameter("Operation", "SUBTRACT")
-        eff.setParameter("ModifierSegmentID", bolus_id)
-        eff.self().onApply()
-        to_log("info", f"  [掏空] 减去 bolus → {shell_mm}mm 壳体")
-    finally:
-        ew.setActiveEffectByName("")
-        ew.setMRMLScene(None)
-        slicer.mrmlScene.RemoveNode(en)
-
-    female_poly = _get_segment_polydata(seg_node, female_name)
-    to_log("info", f"  [阴模] {female_poly.GetNumberOfPoints():,} pts")
-    return female_poly
+    expanded_poly = _get_segment_polydata(seg_node, SEG["temp_bolus_expanded"])
+    shell = _poly_boolean(expanded_poly, bolus_poly, "difference")
+    skin_poly = _get_segment_polydata(seg_node, skin_name)
+    female = _poly_boolean(shell, skin_poly, "difference")
+    to_log("info", f"  [阴模] {female.GetNumberOfPoints():,} pts")
+    return female
 
 
 def _make_male_mold(seg_node, bolus_name, skin_name, skin_padding_mm, base_thickness_mm):
@@ -750,12 +714,7 @@ def _make_male_mold(seg_node, bolus_name, skin_name, skin_padding_mm, base_thick
     z_bot = sb[4]
     base = _make_box_poly(cx, cy, z_bot - base_thickness_mm / 2, bx, by, base_thickness_mm)
 
-    # 用 vtkAppendPolyData 拼接，避免 vtkBooleanOperationPolyDataFilter 的 union 失败
-    append_filter = vtk.vtkAppendPolyData()
-    append_filter.AddInputData(skin_region)
-    append_filter.AddInputData(base)
-    append_filter.Update()
-    male = append_filter.GetOutput()
+    male = _poly_boolean(skin_region, base, "union")
     to_log("info", f"  [阳模] {male.GetNumberOfPoints():,} pts")
     return male
 
@@ -843,10 +802,9 @@ def execute_mold(config):
     _add_model_to_scene(male, "Mold_Male_Base", color=(0.36, 0.55, 0.93), opacity=0.75)
 
     # 清理临时 segment
-    for tmp_name in [SEG["temp_bolus_expanded"], "Mold_Female"]:
-        tmp_id = seg.GetSegmentIdBySegmentName(tmp_name)
-        if tmp_id:
-            seg.RemoveSegment(tmp_id)
+    tmp_id = seg.GetSegmentIdBySegmentName(SEG["temp_bolus_expanded"])
+    if tmp_id:
+        seg.RemoveSegment(tmp_id)
 
     to_log("success", "模具生成完成 — Mold_Female_Conformal（橙色）+ Mold_Male_Base（蓝色）")
 
