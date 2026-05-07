@@ -159,51 +159,54 @@ def execute_pipeline(config):
     editorNode.SetSelectedSegmentID(bolus_id)
 
     try:
+        # 两种方法共用 Step A: COPY skin → bolus
+        effect = _safe_get_effect(editorWidget, "Logical operators")
+        effect.setParameter("Operation", "COPY")
+        effect.setParameter("ModifierSegmentID", skin_id)
+        effect.self().onApply()
+        to_log("info", "  COPY skin → bolus")
+
+        # 两种方法共用 Step B: 形态学闭合，填充 skin 副本表面的细小孔洞
+        effect = _safe_get_effect(editorWidget, "Smoothing")
+        effect.setParameter("SmoothingMethod", "MORPHOLOGICAL_CLOSING")
+        effect.setParameter("KernelSizeMm", str(BOLUS_THICKNESS))
+        effect.self().onApply()
+        to_log("info", f"  CLOSING {BOLUS_THICKNESS}mm (补孔)")
+
+        # Step C: 向外膨胀（两种方法相同）
+        effect = _safe_get_effect(editorWidget, "Margin")
+        effect.setParameter("MarginSizeMm", str(BOLUS_THICKNESS))
+        effect.self().onApply()
+        to_log("info", f"  Margin +{BOLUS_THICKNESS}mm")
+
+        # Step D: 掏空内部（保留壳体）
         if design_method == "hollow":
-            # Hollow 抽壳法：先向外膨胀，再向内抽壳
-            #   COPY skin → Margin +Nmm (外扩) → Hollow INSIDE_SURFACE Nmm (向内抽壳)
-            #   内表面 = 原始皮肤表面，外表面 = skin+Nmm，厚度 = Nmm 均匀壳体
-            effect = _safe_get_effect(editorWidget, "Logical operators")
-            effect.setParameter("Operation", "COPY")
-            effect.setParameter("ModifierSegmentID", skin_id)
-            effect.self().onApply()
-            to_log("info", "  COPY skin → bolus")
-
-            effect = _safe_get_effect(editorWidget, "Margin")
-            effect.setParameter("MarginSizeMm", str(BOLUS_THICKNESS))
-            effect.self().onApply()
-            to_log("info", f"  Margin +{BOLUS_THICKNESS}mm (外扩)")
-
+            # Hollow 抽壳法：用 Hollow INSIDE_SURFACE 做基于距离变换的均匀掏空
             effect = _safe_get_effect(editorWidget, "Hollow")
             effect.setParameter("ShellMode", "INSIDE_SURFACE")
             effect.setParameter("ShellThicknessMm", str(BOLUS_THICKNESS))
             effect.self().onApply()
-            to_log("info", f"  Hollow INSIDE_SURFACE {BOLUS_THICKNESS}mm (向内抽壳)")
+            to_log("info", f"  Hollow INSIDE_SURFACE {BOLUS_THICKNESS}mm")
         else:
-            # 偏移与相减法：COPY skin → Margin 膨胀 → SUBTRACT skin
-            effect = _safe_get_effect(editorWidget, "Logical operators")
-            effect.setParameter("Operation", "COPY")
-            effect.setParameter("ModifierSegmentID", skin_id)
-            effect.self().onApply()
-            to_log("info", "  COPY skin → bolus")
-
-            effect = _safe_get_effect(editorWidget, "Margin")
-            effect.setParameter("MarginSizeMm", str(BOLUS_THICKNESS))
-            effect.self().onApply()
-            to_log("info", f"  Margin +{BOLUS_THICKNESS}mm")
-
+            # 偏移与相减法：直接 SUBTRACT skin
             effect = _safe_get_effect(editorWidget, "Logical operators")
             effect.setParameter("Operation", "SUBTRACT")
             effect.setParameter("ModifierSegmentID", skin_id)
             effect.self().onApply()
             to_log("info", "  SUBTRACT skin (掏空)")
 
-        # 裁切到 ROI/皮肤边界（两种方法共用）
+        # 两种方法共用后处理
         effect = _safe_get_effect(editorWidget, "Logical operators")
         effect.setParameter("Operation", "INTERSECT")
         effect.setParameter("ModifierSegmentID", cutter_id)
         effect.self().onApply()
         to_log("info", "  INTERSECT cutter (裁切)")
+
+        effect = _safe_get_effect(editorWidget, "Smoothing")
+        effect.setParameter("SmoothingMethod", "MORPHOLOGICAL_CLOSING")
+        effect.setParameter("KernelSizeMm", "3.0")
+        effect.self().onApply()
+        to_log("info", "  CLOSING 3mm (封孔)")
 
         effect = _safe_get_effect(editorWidget, "Islands")
         effect.setParameter("Operation", "KEEP_LARGEST_ISLAND")
