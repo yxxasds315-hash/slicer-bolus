@@ -124,10 +124,6 @@ def execute_pipeline(config):
         raise RuntimeError(f"未找到 {SEG['skin']} 段, 请重新运行预览步骤")
     to_log("info", f"  校验通过: {SEG['skin']} 段存在")
 
-    # 超采样：提高标记图分辨率后再做 Margin/Subtract，避免薄壁破洞
-    oversampling = d.get("oversampling", 2.0)
-    _apply_oversampling(seg_node, vol, oversampling)
-
     # Step 3: 补偿器设计 (COPY→Grow→Subtract→Intersect)
     to_log("info", f"[3/5] 补偿器设计 (thickness={d['thickness_mm']}mm)...")
 
@@ -274,6 +270,9 @@ def execute_preview(config):
 
     skin_id = seg_node.GetSegmentation().AddEmptySegment(SEG["skin"], SEG["skin"], (0.2, 0.8, 0.3))
     seg = seg_node.GetSegmentation()
+
+    # 将参考网格超采样后，再运行阈值 → skin 直接从 CT 数据在高分辨率下创建
+    _apply_oversampling(seg_node, vol, d.get("oversampling", 2.0))
 
     editorNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentEditorNode")
     editorWidget = slicer.qMRMLSegmentEditorWidget()
@@ -829,10 +828,6 @@ def execute_mold(config):
         raise RuntimeError(f"未找到 '{bolus_name}'，现有: {names}。请先完成第6步补偿器执行。")
     if not seg.GetSegmentIdBySegmentName(SEG["skin"]):
         raise RuntimeError(f"未找到 '{SEG['skin']}' 段，请先完成预览分割")
-
-    vol = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
-    if vol:
-        _apply_oversampling(seg_node, vol, d.get("oversampling", 2.0))
 
     shell_mm = d.get("mold_shell_thickness_mm", 4.0)
     base_mm = d.get("mold_base_thickness_mm", 2.5)
