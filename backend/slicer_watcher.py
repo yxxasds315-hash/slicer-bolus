@@ -31,33 +31,6 @@ def _safe_get_effect(widget, name):
     return effect
 
 
-def _apply_oversampling(seg_node, vol_node, factor, isotropic=True):
-    """超采样分割的内部二值标记图，提高薄壁/小孔特征的体素精度.
-
-    原理：通过 vtkSlicerSegmentationGeometryLogic 重新计算分割的参考网格几何，
-    使其间距缩小 factor 倍（如 factor=3 则体素数增加 27 倍）。
-    之后所有 Segment Editor 二元操作（Margin/Logical/Smoothing）都在高分辨率网格上运行，
-    闭曲面提取也受益于更密的采样。
-
-    参考：Slicer 官方文档 script_repository/segmentations.md
-      "Resample segmentation to higher resolution"
-    """
-    import slicer
-    geo_logic = slicer.vtkSlicerSegmentationGeometryLogic()
-    geo_logic.SetInputSegmentationNode(seg_node)
-    geo_logic.SetSourceGeometryNode(vol_node)
-    geo_logic.SetOversamplingFactor(factor)
-    geo_logic.SetIsotropicSpacing(isotropic)
-    geo_logic.CalculateOutputGeometry()
-    geo_logic.SetReferenceImageGeometryInSegmentationNode()
-    geo_logic.ResampleLabelmapsInSegmentationNode()
-    seg = seg_node.GetSegmentation()
-    # 标记图已经超采样，闭曲面转换时不需要再做 oversampling（会导致双重细分 + 阶梯感）
-    seg.SetConversionParameter("Oversampling factor", "1.0")
-    seg.SetConversionParameter("Smoothing factor", "0.3")
-    to_log("info", f"  [超采样] {factor}x, isotropic={isotropic}")
-
-
 def to_log(level, msg):
     entry = json.dumps({"timestamp": time.strftime("%H:%M:%S"), "level": level, "message": msg})
     try:
@@ -123,9 +96,6 @@ def execute_pipeline(config):
     if not skin_id:
         raise RuntimeError(f"未找到 {SEG['skin']} 段, 请重新运行预览步骤")
     to_log("info", f"  校验通过: {SEG['skin']} 段存在")
-
-    # 超采样标记图以提高 Margin/Subtract 精度（5mm 厚度在原生分辨率仅 ~5 体素，易薄壁破洞）
-    _apply_oversampling(seg_node, vol, d.get("oversampling", 2.0))
 
     # Step 3: 补偿器设计 (COPY→Grow→Subtract→Intersect)
     to_log("info", f"[3/5] 补偿器设计 (thickness={d['thickness_mm']}mm)...")
@@ -828,10 +798,6 @@ def execute_mold(config):
         raise RuntimeError(f"未找到 '{bolus_name}'，现有: {names}。请先完成第6步补偿器执行。")
     if not seg.GetSegmentIdBySegmentName(SEG["skin"]):
         raise RuntimeError(f"未找到 '{SEG['skin']}' 段，请先完成预览分割")
-
-    vol = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
-    if vol:
-        _apply_oversampling(seg_node, vol, d.get("oversampling", 2.0))
 
     shell_mm = d.get("mold_shell_thickness_mm", 4.0)
     base_mm = d.get("mold_base_thickness_mm", 2.5)
