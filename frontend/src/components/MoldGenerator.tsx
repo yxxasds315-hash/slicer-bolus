@@ -20,8 +20,8 @@ export function MoldGenerator({ config, onChange, onGenerate, moldStatus, moldEr
 
         <div>
           <div className="flex justify-between mb-1.5"><label className="text-sm text-medical-400">壳体壁厚</label><span className="text-sm font-mono text-accent-300">{config.mold_shell_thickness_mm} mm</span></div>
-          <input type="range" min={2} max={8} step={0.5} value={config.mold_shell_thickness_mm} onChange={(e) => onChange({ mold_shell_thickness_mm: Number(e.target.value) })} className="slider-medical" />
-          <p className="text-xs text-medical-500 mt-0.5">阴模壳体厚度 & 法兰宽度</p>
+          <input type="range" min={4} max={10} step={0.5} value={config.mold_shell_thickness_mm} onChange={(e) => onChange({ mold_shell_thickness_mm: Number(e.target.value) })} className="slider-medical" />
+          <p className="text-xs text-medical-500 mt-0.5">最小 4mm（Z 向 ≥ 1 体素）</p>
         </div>
 
         <div>
