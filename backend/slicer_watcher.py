@@ -138,6 +138,11 @@ def execute_pipeline(config):
         bounds[min_axis*2] = center - safe_depth / 2.0
         bounds[min_axis*2 + 1] = center + safe_depth / 2.0
 
+    # cutter 在所有轴上外扩 2x bolus 厚度，确保膨胀后的 bolus 完全落入裁切范围
+    for i in range(3):
+        bounds[i*2] -= BOLUS_THICKNESS * 2
+        bounds[i*2 + 1] += BOLUS_THICKNESS * 2
+
     cube = vtk.vtkCubeSource()
     cube.SetBounds(bounds)
     cube.Update()
