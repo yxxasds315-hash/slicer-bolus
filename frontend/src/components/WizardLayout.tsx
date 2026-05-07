@@ -125,9 +125,13 @@ export function WizardLayout({ children, currentStep, totalSteps: _ts, onNext, o
         <div className="flex justify-between mt-6 pt-4 border-t border-medical-700">
           <button onClick={onPrev} disabled={currentStep === 1} className="btn-secondary text-sm disabled:opacity-30 disabled:cursor-not-allowed">← 上一步</button>
           <div className="text-medical-500 text-sm self-center">{currentStep} / {totalSteps}</div>
-          <button onClick={onNext} disabled={!canNext || status === 'running'} className="btn-primary text-sm">
-            {(() => { const ExportIcon = STEP_ICONS[7]; return isLast ? (<span className="flex items-center gap-1.5"><ExportIcon className="w-4 h-4" />导出</span>) : status === 'running' && currentStep === 5 ? ('运行中...') : ('下一步 →'); })()}
-          </button>
+          {isLast ? (
+            <div className="w-[80px]" />
+          ) : (
+            <button onClick={onNext} disabled={!canNext || status === 'running'} className="btn-primary text-sm">
+              {status === 'running' && currentStep === 5 ? '运行中...' : '下一步 →'}
+            </button>
+          )}
         </div>
       </div>
     </div>
