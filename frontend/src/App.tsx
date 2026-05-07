@@ -134,7 +134,7 @@ export default function App() {
     }
   };
 
-  if (conn !== 'online') {
+  if (!devMode && conn !== 'online') {
     const statusText = conn === 'checking' ? '检测中...' : conn === 'launching' ? '启动中...' : conn === 'no_watcher' ? 'Slicer 已运行但未加载桥接脚本' : 'Slicer 未连接';
     const isSpinning = conn === 'checking' || conn === 'launching';
     const isNoWatcher = conn === 'no_watcher';
