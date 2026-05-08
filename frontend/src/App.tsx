@@ -52,7 +52,10 @@ export default function App() {
   const [validateResult, setValidateResult] = useState<ValidateResult | null>(null);
   const [validateError, setValidateError] = useState('');
   const [jumpMsg, setJumpMsg] = useState('');
-  const [pipelineThickness, setPipelineThickness] = useState<number | null>(null);
+  const [pipelineThickness, setPipelineThickness] = useState<number | null>(() => {
+    const v = sessionStorage.getItem('pipelineThickness');
+    return v !== null ? parseFloat(v) : null;
+  });
 
   const { logs: wsLogs, clearLogs } = useSSELog(pipeStatus);
   const logs = wsLogs.length > 0 ? wsLogs : localLogs;
@@ -121,7 +124,7 @@ export default function App() {
   const handleNext = () => { if (step === 5 && pipeStatus !== 'completed') { executePipeline(); return; } setStep((s) => Math.min(s + 1, 8)); };
   const addLocalLog = (level: LogEntry['level'], msg: string) => setLocalLogs((p) => [...p, { timestamp: new Date().toLocaleTimeString(), level, message: msg }]);
 
-  const executePipeline = async () => { setPipeStatus('running'); setLocalLogs([]); clearLogs(); addLocalLog('info', 'Starting pipeline...'); try { const r = await fetch('/api/execute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...config, use_existing_volumes: config.dicom_dir === '__slicer__' }) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || 'Failed'); } const d = await r.json(); addLocalLog('success', `Done! ${d.output_files?.join(', ') || ''}`); setPipeStatus('completed'); setPipelineThickness(config.thickness_mm); } catch (err: any) { addLocalLog('error', err.message); setPipeStatus('error'); } };
+  const executePipeline = async () => { setPipeStatus('running'); setLocalLogs([]); clearLogs(); addLocalLog('info', 'Starting pipeline...'); try { const r = await fetch('/api/execute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...config, use_existing_volumes: config.dicom_dir === '__slicer__' }) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || 'Failed'); } const d = await r.json(); addLocalLog('success', `Done! ${d.output_files?.join(', ') || ''}`); setPipeStatus('completed'); setPipelineThickness(config.thickness_mm); sessionStorage.setItem('pipelineThickness', String(config.thickness_mm)); } catch (err: any) { addLocalLog('error', err.message); setPipeStatus('error'); } };
 
   const canJumpToStep = (target: number): string | null => {
     if (target <= 1) return null;
@@ -160,7 +163,7 @@ export default function App() {
   const handlePrev = () => {
     const prev = Math.max(step - 1, 1);
     setStep(prev);
-    if (step >= 5) setPipeStatus('idle');
+    if (step === 5) setPipeStatus('idle');
     if (step === 6) setMoldStatus('idle');
     if (step === 7) setValidateStatus('idle');
   };
