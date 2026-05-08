@@ -106,10 +106,10 @@ export function ExportPanel({ config, onChange, slicer }: Props) {
       )}
 
       <div className="bg-medical-700/50 rounded-lg p-4 border border-accent-400/20">
-        <h3 className="text-sm font-medium text-accent-300 mb-2">🔄 坐标系说明</h3>
+        <h3 className="text-sm font-medium text-accent-300 mb-2">坐标系说明</h3>
         <ul className="text-xs text-medical-400 space-y-1">
-          <li>• Slicer 内部: <span className="text-accent-200">RAS</span> (右-前-上)</li>
-          <li>• STL 导出: 自动转换 <span className="text-accent-200">LPS</span> (左-后-上)</li>
+          <li>• STL 导出保持 <span className="text-accent-200">RAS</span> 坐标系 (Slicer 原生)</li>
+          <li>• 导入切片软件时请确认坐标系设置</li>
         </ul>
       </div>
 

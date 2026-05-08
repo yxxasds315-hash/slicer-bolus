@@ -3,6 +3,7 @@ Bolus Designer — Flask 后端 (独立进程, 不依赖 Slicer 进程的 socket
 通过文件与 Slicer 通信
 """
 import json, logging, os, time, threading, queue, uuid, subprocess
+from collections import deque
 from datetime import datetime
 
 FILES = {
@@ -22,7 +23,8 @@ except ImportError:
 
 app = Flask(__name__)
 _sse_queues: list[queue.Queue] = []
-_log_history: list[str] = []
+_sse_lock = threading.Lock()
+_log_history: deque[str] = deque(maxlen=1000)
 _dispatch_lock = threading.Lock()
 logging.basicConfig(level=logging.WARNING, format='[%(levelname)s] %(message)s')
 
@@ -31,11 +33,12 @@ def _broadcast(entry: str):
     _log_history.append(entry)
     with open(FILES["logs"], "a") as f:
         f.write(entry + "\n")
-    dead = []
-    for q in _sse_queues:
-        try: q.put_nowait(entry)
-        except queue.Full: dead.append(q)
-    for q in dead: _sse_queues.remove(q)
+    with _sse_lock:
+        dead = []
+        for q in _sse_queues:
+            try: q.put_nowait(entry)
+            except queue.Full: dead.append(q)
+        for q in dead: _sse_queues.remove(q)
 
 
 def _read_json(path):
@@ -158,6 +161,13 @@ def mold_generate():
     return _dispatch_slicer(config, "mold", f"模具生成: 壳体{config.get('mold_shell_thickness_mm', 4.0)}mm, bolus={t}mm")
 
 
+@app.route('/api/validate', methods=['POST'])
+def validate():
+    config = request.get_json(force=True)
+    t = config.get("thickness_mm", 5.0)
+    return _dispatch_slicer(config, "validate", f"适形度评估: bolus={t}mm")
+
+
 @app.route('/api/preview/finalize', methods=['POST'])
 def finalize_preview():
     config = request.get_json(force=True)
@@ -173,16 +183,19 @@ def create_roi():
 @app.route('/api/logs/stream')
 def log_stream():
     q: queue.Queue = queue.Queue(maxsize=200)
-    _sse_queues.append(q)
+    with _sse_lock:
+        _sse_queues.append(q)
 
     def generate():
-        for entry in _log_history:
+        for entry in list(_log_history):
             yield f"data: {entry}\n\n"
         try:
             while True:
                 yield f"data: {q.get()}\n\n"
         except GeneratorExit:
-            _sse_queues.remove(q)
+            with _sse_lock:
+                try: _sse_queues.remove(q)
+                except ValueError: pass
 
     return Response(generate(), mimetype='text/event-stream',
                     headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
