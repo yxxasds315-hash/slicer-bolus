@@ -17,9 +17,9 @@ export function ExecutionPanel({ config, status, logs }: ExecutionPanelProps) {
       <div className="bg-medical-900/50 rounded-lg p-4 border border-medical-700">
         <h3 className="text-xs font-medium text-medical-400 mb-3 uppercase tracking-wider">参数摘要</h3>
         <div className="grid grid-cols-2 gap-2 text-xs">
-          <ConfigRow label="DICOM" value={config.dicom_dir || '(未设置)'} /><ConfigRow label="阈值" value={`${config.hu_threshold} HU`} />
+          <ConfigRow label="DICOM" value={config.dicom_dir || '(未设置)'} />
           <ConfigRow label="设计方法" value={config.design_method === 'offset_subtract' ? '偏移与相减' : 'Hollow 抽壳'} /><ConfigRow label="厚度" value={`${config.thickness_mm} mm`} />
-          <ConfigRow label="平滑" value={`${config.smoothing_method} / ${config.smoothing_kernel_mm}mm`} /><ConfigRow label="过采样" value={`${config.oversampling}x`} />
+          <ConfigRow label="平滑" value={`${config.smoothing_method} / ${config.smoothing_kernel_mm}mm`} />
           <ConfigRow label="输出" value={config.output_dir || '(未设置)'} />
         </div>
       </div>

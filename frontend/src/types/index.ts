@@ -2,8 +2,6 @@ export interface PipelineConfig {
   dicom_dir: string;
   output_dir: string;
   thickness_mm: number;
-  hu_threshold: number;
-  oversampling: number;
   smoothing_method: 'MEDIAN' | 'GAUSSIAN' | 'MORPHOLOGICAL_OPENING' | 'JOINT_TAUBIN';
   smoothing_kernel_mm: number;
   design_method: 'offset_subtract' | 'hollow';
@@ -24,6 +22,16 @@ export interface PipelineConfig {
 }
 
 export type MoldStatus = 'idle' | 'running' | 'completed' | 'error';
+export type ValidateStatus = 'idle' | 'running' | 'completed' | 'error';
+
+export interface ValidateResult {
+  status: 'PASS' | 'FAIL';
+  MHD_mm: number;
+  HD95_mm: number;
+  Dice: number;
+  volume_ratio: number;
+  flange_RMS_mm: number;
+}
 
 export interface LogEntry {
   timestamp: string;

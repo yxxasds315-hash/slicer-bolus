@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import type { PipelineConfig, LogEntry, PipelineStatus, SlicerState, MoldStatus } from './types';
+import type { PipelineConfig, LogEntry, PipelineStatus, SlicerState, MoldStatus, ValidateStatus, ValidateResult } from './types';
 import { WizardLayout } from './components/WizardLayout';
 import { DicomSelector } from './components/DicomSelector';
 import { SegmentationPanel, type PreviewStatus } from './components/SegmentationPanel';
@@ -8,12 +8,13 @@ import { RoiSelector } from './components/RoiSelector';
 import { ExecutionPanel } from './components/ExecutionPanel';
 import { SlicerMonitor } from './components/SlicerMonitor';
 import { MoldGenerator } from './components/MoldGenerator';
+import { ValidatePanel } from './components/ValidatePanel';
 import { ExportPanel } from './components/ExportPanel';
 import { useSSELog } from './hooks/useSSELog';
 
 const defaultConfig: PipelineConfig = {
   dicom_dir: '', output_dir: '',
-  thickness_mm: 5.0, hu_threshold: -200, oversampling: 3.0,
+  thickness_mm: 5.0,
   smoothing_method: 'MEDIAN', smoothing_kernel_mm: 3.0,
   design_method: 'offset_subtract',
   roi_mode: 'full_skin', roi_segment_id: '',
@@ -47,6 +48,9 @@ export default function App() {
   const [previewError, setPreviewError] = useState('');
   const [moldStatus, setMoldStatus] = useState<MoldStatus>('idle');
   const [moldError, setMoldError] = useState('');
+  const [validateStatus, setValidateStatus] = useState<ValidateStatus>('idle');
+  const [validateResult, setValidateResult] = useState<ValidateResult | null>(null);
+  const [validateError, setValidateError] = useState('');
 
   const { logs: wsLogs, clearLogs } = useSSELog(pipeStatus);
   const logs = wsLogs.length > 0 ? wsLogs : localLogs;
@@ -90,7 +94,8 @@ export default function App() {
       case 3: return true; case 4: return config.thickness_mm > 0;
       case 5: return pipeStatus !== 'running';
       case 6: return true;
-      case 7: return config.output_dir.trim().length > 0;
+      case 7: return validateStatus !== 'running';
+      case 8: return config.output_dir.trim().length > 0;
       default: return false;
     }
   };
@@ -101,8 +106,9 @@ export default function App() {
   const handleSeal = async () => { setPreviewStatus('running'); setPreviewError(''); try { const r = await fetch('/api/seal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '二次封口失败'); } setPreviewStatus('sealed'); } catch (err: any) { setPreviewStatus('error'); setPreviewError(err.message); } };
   const handleFinalize = async () => { setPreviewStatus('running'); setPreviewError(''); try { const r = await fetch('/api/preview/finalize', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '后处理失败'); } setPreviewStatus('done'); } catch (err: any) { setPreviewStatus('error'); setPreviewError(err.message); } };
   const handleMold = async () => { setMoldStatus('running'); setMoldError(''); try { const r = await fetch('/api/mold/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '模具生成失败'); } setMoldStatus('completed'); } catch (err: any) { setMoldStatus('error'); setMoldError(err.message); } };
+  const handleValidate = async () => { setValidateStatus('running'); setValidateError(''); setValidateResult(null); try { const r = await fetch('/api/validate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '评估失败'); } const d = await r.json(); const result = d.output_files?.[0]; if (result && result.status) { setValidateResult(result); setValidateStatus('completed'); } else { throw new Error('返回数据格式异常'); } } catch (err: any) { setValidateStatus('error'); setValidateError(err.message); } };
 
-  const handleNext = () => { if (step === 5 && pipeStatus !== 'completed') { executePipeline(); return; } setStep((s) => Math.min(s + 1, 7)); };
+  const handleNext = () => { if (step === 5 && pipeStatus !== 'completed') { executePipeline(); return; } setStep((s) => Math.min(s + 1, 8)); };
   const addLocalLog = (level: LogEntry['level'], msg: string) => setLocalLogs((p) => [...p, { timestamp: new Date().toLocaleTimeString(), level, message: msg }]);
 
   const executePipeline = async () => { setPipeStatus('running'); setLocalLogs([]); clearLogs(); addLocalLog('info', 'Starting pipeline...'); try { const r = await fetch('/api/execute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...config, use_existing_volumes: config.dicom_dir === '__slicer__' }) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || 'Failed'); } const d = await r.json(); addLocalLog('success', `Done! ${d.output_files?.join(', ') || ''}`); setPipeStatus('completed'); } catch (err: any) { addLocalLog('error', err.message); setPipeStatus('error'); } };
@@ -111,6 +117,7 @@ export default function App() {
     if (target >= 2) setPreviewStatus('done');
     if (target >= 5) setPipeStatus('completed');
     if (target >= 6) setMoldStatus('completed');
+    if (target >= 7) setValidateStatus('completed');
     setStep(target);
   };
   const handlePrev = () => {
@@ -118,6 +125,7 @@ export default function App() {
     setStep(prev);
     if (step >= 5) setPipeStatus('idle');
     if (step === 6) setMoldStatus('idle');
+    if (step === 7) setValidateStatus('idle');
   };
 
   const renderStep = () => {
@@ -128,7 +136,8 @@ export default function App() {
       case 4: return <BolusDesigner config={config} onChange={updateConfig} />;
       case 5: return <ExecutionPanel config={config} status={pipeStatus} logs={logs} onExecute={executePipeline} slicer={slicer} />;
       case 6: return <MoldGenerator config={config} onChange={updateConfig} onGenerate={handleMold} moldStatus={moldStatus} moldError={moldError} />;
-      case 7: return <ExportPanel config={config} onChange={updateConfig} slicer={slicer} />;
+      case 7: return <ValidatePanel config={config} onValidate={handleValidate} validateStatus={validateStatus} validateResult={validateResult} validateError={validateError} />;
+      case 8: return <ExportPanel config={config} onChange={updateConfig} slicer={slicer} />;
     }
   };
 
@@ -139,5 +148,5 @@ export default function App() {
     return (<><div className="min-h-screen flex items-center justify-center bg-medical-900 pb-12"><div className="wizard-card w-full max-w-md p-8 text-center"><h1 className="text-2xl font-bold text-accent-200 mb-2">Bolus Designer</h1><p className="text-medical-500 text-sm mb-8">放疗个性化补偿器数字化设计平台</p><div className="mb-6">{isSpinning ? <div className="animate-spin inline-block w-8 h-8 border-2 border-accent-400 border-t-transparent rounded-full" /> : isNoWatcher ? <div className="text-5xl mb-3">⚠️</div> : <div className="text-5xl mb-3">🔬</div>}<p className={`text-sm mt-3 ${isNoWatcher ? 'text-warning font-medium' : 'text-medical-400'}`}>{statusText}</p>{isNoWatcher && <p className="text-xs text-medical-500 mt-2">Slicer 进程已运行，但未通过 --python-script 加载桥接脚本。<br/>点击下方按钮自动修复（关闭并重启 Slicer）。</p>}</div><button onClick={launchSlicer} disabled={conn === 'launching' || conn === 'checking'} className="btn-primary w-full mb-3 text-base">{conn === 'launching' ? '启动中...' : isNoWatcher ? '🔧 自动修复并重启 Slicer' : '🚀 启动 3D Slicer'}</button>{launchLog && <div className="log-stream mt-4 text-left"><pre className="text-xs text-gray-300 whitespace-pre-wrap">{launchLog}</pre></div>}</div></div><SlicerMonitor slicer={slicer} slicerOnline={slicerOnline} logs={logs} pipeStatus={pipeStatus} /></>);
   }
 
-  return (<><WizardLayout currentStep={step} totalSteps={7} onNext={handleNext} onPrev={handlePrev} canNext={canNext()} isLast={step === 7} status={pipeStatus} slicer={slicer} slicerOnline={slicerOnline} onReconnect={launchSlicer} connecting={conn === 'launching'} onJumpToStep={handleJumpToStep} devMode={devMode}>{renderStep()}</WizardLayout><SlicerMonitor slicer={slicer} slicerOnline={slicerOnline} logs={logs} pipeStatus={pipeStatus} /></>);
+  return (<><WizardLayout currentStep={step} totalSteps={8} onNext={handleNext} onPrev={handlePrev} canNext={canNext()} isLast={step === 8} status={pipeStatus} slicer={slicer} slicerOnline={slicerOnline} onReconnect={launchSlicer} connecting={conn === 'launching'} onJumpToStep={handleJumpToStep} devMode={devMode}>{renderStep()}</WizardLayout><SlicerMonitor slicer={slicer} slicerOnline={slicerOnline} logs={logs} pipeStatus={pipeStatus} /></>);
 }
