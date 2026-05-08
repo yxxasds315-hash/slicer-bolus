@@ -52,6 +52,7 @@ export default function App() {
   const [validateResult, setValidateResult] = useState<ValidateResult | null>(null);
   const [validateError, setValidateError] = useState('');
   const [jumpMsg, setJumpMsg] = useState('');
+  const [pipelineThickness, setPipelineThickness] = useState<number | null>(null);
 
   const { logs: wsLogs, clearLogs } = useSSELog(pipeStatus);
   const logs = wsLogs.length > 0 ? wsLogs : localLogs;
@@ -92,9 +93,10 @@ export default function App() {
     switch (step) {
       case 1: return config.dicom_dir.trim().length > 0 || slicer.volumes.length > 0;
       case 2: return previewStatus === 'done';
-      case 3: return true; case 4: return config.thickness_mm > 0;
+      case 3: return config.roi_mode === 'full_skin' || (slicer?.rois?.length ?? 0) > 0;
+      case 4: return config.thickness_mm > 0;
       case 5: return pipeStatus !== 'running';
-      case 6: return true;
+      case 6: return moldStatus === 'completed';
       case 7: return validateStatus !== 'running';
       case 8: return config.output_dir.trim().length > 0;
       default: return false;
@@ -106,13 +108,20 @@ export default function App() {
   const handleSolidify = async () => { setPreviewStatus('running'); setPreviewError(''); try { const r = await fetch('/api/solidify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '实心化失败'); } setPreviewStatus('solidified'); } catch (err: any) { setPreviewStatus('error'); setPreviewError(err.message); } };
   const handleSeal = async () => { setPreviewStatus('running'); setPreviewError(''); try { const r = await fetch('/api/seal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '二次封口失败'); } setPreviewStatus('sealed'); } catch (err: any) { setPreviewStatus('error'); setPreviewError(err.message); } };
   const handleFinalize = async () => { setPreviewStatus('running'); setPreviewError(''); try { const r = await fetch('/api/preview/finalize', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '后处理失败'); } setPreviewStatus('done'); } catch (err: any) { setPreviewStatus('error'); setPreviewError(err.message); } };
-  const handleMold = async () => { setMoldStatus('running'); setMoldError(''); try { const r = await fetch('/api/mold/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '模具生成失败'); } setMoldStatus('completed'); } catch (err: any) { setMoldStatus('error'); setMoldError(err.message); } };
+  const handleMold = async () => {
+    if (pipelineThickness !== null && config.thickness_mm !== pipelineThickness) {
+      setMoldStatus('error');
+      setMoldError(`厚度已从 ${pipelineThickness}mm 改为 ${config.thickness_mm}mm，场景中的 Bolus_${pipelineThickness}mm 与当前设置不匹配。请返回第 5 步重新执行流水线。`);
+      return;
+    }
+    setMoldStatus('running'); setMoldError(''); try { const r = await fetch('/api/mold/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '模具生成失败'); } setMoldStatus('completed'); } catch (err: any) { setMoldStatus('error'); setMoldError(err.message); }
+  };
   const handleValidate = async () => { setValidateStatus('running'); setValidateError(''); setValidateResult(null); try { const r = await fetch('/api/validate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '评估失败'); } const d = await r.json(); const result = d.output_files?.[0]; if (result && result.status) { setValidateResult(result); setValidateStatus('completed'); } else { throw new Error('返回数据格式异常'); } } catch (err: any) { setValidateStatus('error'); setValidateError(err.message); } };
 
   const handleNext = () => { if (step === 5 && pipeStatus !== 'completed') { executePipeline(); return; } setStep((s) => Math.min(s + 1, 8)); };
   const addLocalLog = (level: LogEntry['level'], msg: string) => setLocalLogs((p) => [...p, { timestamp: new Date().toLocaleTimeString(), level, message: msg }]);
 
-  const executePipeline = async () => { setPipeStatus('running'); setLocalLogs([]); clearLogs(); addLocalLog('info', 'Starting pipeline...'); try { const r = await fetch('/api/execute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...config, use_existing_volumes: config.dicom_dir === '__slicer__' }) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || 'Failed'); } const d = await r.json(); addLocalLog('success', `Done! ${d.output_files?.join(', ') || ''}`); setPipeStatus('completed'); } catch (err: any) { addLocalLog('error', err.message); setPipeStatus('error'); } };
+  const executePipeline = async () => { setPipeStatus('running'); setLocalLogs([]); clearLogs(); addLocalLog('info', 'Starting pipeline...'); try { const r = await fetch('/api/execute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...config, use_existing_volumes: config.dicom_dir === '__slicer__' }) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || 'Failed'); } const d = await r.json(); addLocalLog('success', `Done! ${d.output_files?.join(', ') || ''}`); setPipeStatus('completed'); setPipelineThickness(config.thickness_mm); } catch (err: any) { addLocalLog('error', err.message); setPipeStatus('error'); } };
 
   const canJumpToStep = (target: number): string | null => {
     if (target <= 1) return null;
