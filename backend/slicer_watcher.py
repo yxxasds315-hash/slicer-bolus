@@ -185,66 +185,55 @@ def execute_pipeline(config):
     seg.CreateRepresentation(slicer.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName())
     to_log("info", "  Cutter 掩膜已创建并光栅化")
 
-    editorNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentEditorNode")
-    editorWidget = slicer.qMRMLSegmentEditorWidget()
-    editorWidget.setMRMLScene(slicer.mrmlScene)
-    editorWidget.setMRMLSegmentEditorNode(editorNode)
-    editorWidget.setSegmentationNode(seg_node)
-    editorWidget.setSourceVolumeNode(vol)
-    editorNode.SetOverwriteMode(slicer.vtkMRMLSegmentEditorNode.OverwriteNone)
-    editorNode.SetSelectedSegmentID(bolus_id)
+    import numpy as np
+    from scipy.ndimage import distance_transform_edt, label as _scipy_label
 
-    try:
-        # Step A: COPY skin → bolus
-        effect = _safe_get_effect(editorWidget, "Logical operators")
-        effect.setParameter("Operation", "COPY")
-        effect.setParameter("ModifierSegmentID", skin_id)
-        effect.self().onApply()
-        to_log("info", "  COPY skin → bolus")
+    # 体素间距: Slicer 返回 (x,y,z)，numpy 数组轴序为 (z,y,x)
+    sx, sy, sz = vol.GetSpacing()
+    spacing_zyx = (sz, sy, sx)
+    to_log("info", f"  体素间距 x={sx:.2f} y={sy:.2f} z={sz:.2f} mm")
 
-        # Step B: 向外膨胀
-        effect = _safe_get_effect(editorWidget, "Margin")
-        effect.setParameter("MarginSizeMm", str(BOLUS_THICKNESS))
-        effect.self().onApply()
-        to_log("info", f"  Margin +{BOLUS_THICKNESS}mm")
+    skin_arr = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, skin_id, vol).astype(bool)
+    to_log("info", f"  Skin 数组 shape={skin_arr.shape}")
 
-        # Step C: 掏空内部
-        if design_method == "hollow":
-            effect = _safe_get_effect(editorWidget, "Hollow")
-            effect.setParameter("ShellMode", "INSIDE_SURFACE")
-            effect.setParameter("ShellThicknessMm", str(BOLUS_THICKNESS))
-            effect.self().onApply()
-            to_log("info", f"  Hollow INSIDE_SURFACE {BOLUS_THICKNESS}mm")
-        else:
-            effect = _safe_get_effect(editorWidget, "Logical operators")
-            effect.setParameter("Operation", "SUBTRACT")
-            effect.setParameter("ModifierSegmentID", skin_id)
-            effect.self().onApply()
-            to_log("info", "  SUBTRACT skin (掏空)")
+    # 检查 skin 是否实心化：连通体分析 ~skin，最大分量=外部空气，其余=内腔
+    _air_labeled, _n_air = _scipy_label(~skin_arr)
+    if _n_air > 1:
+        _air_sizes = np.bincount(_air_labeled.ravel())[1:]
+        _internal_vox = int(_air_sizes.sum() - _air_sizes.max())
+        _internal_cm3 = _internal_vox * sx * sy * sz / 1000
+        if _internal_cm3 > 5.0:
+            to_log("warning", f"  ⚠ 检测到 {_n_air - 1} 处内部气腔 ({_internal_cm3:.1f} cm³)")
+            to_log("warning", "  ⚠ EDT 会把鼻窦/气管等内腔计为皮肤外侧，产生伪影 bolus")
+            to_log("warning", "  ⚠ 建议先执行「实心化」步骤再继续")
 
-        # 后处理
-        effect = _safe_get_effect(editorWidget, "Logical operators")
-        effect.setParameter("Operation", "INTERSECT")
-        effect.setParameter("ModifierSegmentID", cutter_id)
-        effect.self().onApply()
-        to_log("info", "  INTERSECT cutter (裁切)")
+    # EDT: 每个皮肤外侧体素到皮肤表面的精确欧氏距离（mm）
+    to_log("info", "  [EDT] 计算精确欧氏距离变换...")
+    edt = distance_transform_edt(~skin_arr, sampling=spacing_zyx)
 
-        effect = _safe_get_effect(editorWidget, "Islands")
-        effect.setParameter("Operation", "KEEP_LARGEST_ISLAND")
-        effect.self().onApply()
-        to_log("info", "  Islands 保留最大岛")
+    # Bolus = 皮肤外侧 且 距皮肤表面 ≤ thickness_mm（两种 design_method 结果一致）
+    bolus_arr = (edt > 0) & (edt <= BOLUS_THICKNESS)
+    to_log("info", f"  Bolus 初始体积: {bolus_arr.sum()} 体素")
 
-        effect = _safe_get_effect(editorWidget, "Smoothing")
-        effect.setParameter("SmoothingMethod", "MEDIAN")
-        effect.setParameter("KernelSizeMm", "2.0")
-        effect.self().onApply()
-        to_log("info", "  Smooth MEDIAN 2mm")
-    finally:
-        editorWidget.setActiveEffectByName("")
-        editorWidget.setMRMLScene(None)
-        slicer.mrmlScene.RemoveNode(editorNode)
-
+    # 应用 ROI cutter 掩膜
+    cutter_arr = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, cutter_id, vol).astype(bool)
     seg.RemoveSegment(cutter_id)
+    bolus_arr &= cutter_arr
+    to_log("info", f"  裁切后体积: {bolus_arr.sum()} 体素")
+
+    # 保留最大连通体（替代 Islands KEEP_LARGEST_ISLAND）
+    labeled, n_components = _scipy_label(bolus_arr)
+    if n_components == 0:
+        raise RuntimeError("Bolus 生成失败: EDT 结果为空，请检查皮肤分割和 ROI")
+    if n_components > 1:
+        sizes = np.bincount(labeled.ravel())[1:]
+        bolus_arr = labeled == (np.argmax(sizes) + 1)
+        to_log("info", f"  Islands: {n_components} 个连通体 → 保留最大 ({sizes.max()} 体素)")
+
+    slicer.util.updateSegmentBinaryLabelmapFromArray(
+        bolus_arr.astype(np.int8), seg_node, bolus_id, vol
+    )
+    to_log("info", "  [EDT] Bolus 已写入 Slicer")
     seg_node.CreateClosedSurfaceRepresentation()
 
     polyData = vtk.vtkPolyData()
