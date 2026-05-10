@@ -743,13 +743,23 @@ def _add_model_to_scene(poly, name, color=(0.8, 0.5, 0.3), opacity=0.7):
 
 
 def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm):
-    """阴模：Segment Editor 二元标记图 COPY+SUBTRACT，避免 VTK 布尔重合面问题"""
+    """阴模：bolus 外扩 shell_mm，再依次掏除 bolus 与 skin
+
+    SUBTRACT skin 的作用：3D Slicer 的 Margin 是各向同性膨胀，会让 Bolus_Expanded
+    向皮肤方向也扩 shell_mm。直接 expanded - bolus 得到的壳体内壁会嵌入皮肤
+    shell_mm 深，造成模具物理戴不上去。再 SUBTRACT skin 让内壁严格贴皮不入侵。
+    """
     to_log("info", "── 阴模生成 ──")
     seg = seg_node.GetSegmentation()
 
     _apply_margin_to_segment(seg_node, bolus_name, shell_mm, SEG["temp_bolus_expanded"])
 
     expanded_id = seg.GetSegmentIdBySegmentName(SEG["temp_bolus_expanded"])
+    bolus_id = seg.GetSegmentIdBySegmentName(bolus_name)
+    skin_id = seg.GetSegmentIdBySegmentName(skin_name)
+    if not skin_id:
+        raise RuntimeError(f"找不到 skin 段 '{skin_name}'，无法防穿模")
+
     female_name = "Mold_Female"
     female_id = seg.AddEmptySegment(female_name, female_name)
     ref_volume = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
@@ -773,9 +783,15 @@ def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm):
 
         eff = _safe_get_effect(ew, "Logical operators")
         eff.setParameter("Operation", "SUBTRACT")
-        eff.setParameter("ModifierSegmentID", seg.GetSegmentIdBySegmentName(bolus_name))
+        eff.setParameter("ModifierSegmentID", bolus_id)
         eff.self().onApply()
         to_log("info", f"  [掏空] 减去 bolus → {shell_mm}mm 壳体")
+
+        eff = _safe_get_effect(ew, "Logical operators")
+        eff.setParameter("Operation", "SUBTRACT")
+        eff.setParameter("ModifierSegmentID", skin_id)
+        eff.self().onApply()
+        to_log("info", "  [防穿模] 减去 skin → 内壁贴皮不入侵")
     finally:
         ew.setActiveEffectByName("")
         ew.setMRMLScene(None)
@@ -787,11 +803,27 @@ def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm):
 
 
 def _make_male_mold(seg_node, bolus_name, skin_name, skin_padding_mm, base_thickness_mm):
+    """阳模：阴模底面在皮肤上的投影区域 + 基底
+
+    使用 bolus_expanded 的 XY 边界（而非 bolus 边界）确定 clip_box，
+    让阳模顶面 footprint 与新阴模底面（= skin ∩ bolus_expanded）严格匹配，
+    避免 male 比 female 小一圈导致接合处错位。
+    """
     to_log("info", "── 阳模生成 ──")
     bolus_poly = _get_segment_polydata(seg_node, bolus_name)
     skin_poly = _get_segment_polydata(seg_node, skin_name)
-    b = bolus_poly.GetBounds()
-    pad = skin_padding_mm
+
+    seg = seg_node.GetSegmentation()
+    expanded_id = seg.GetSegmentIdBySegmentName(SEG["temp_bolus_expanded"])
+    if expanded_id:
+        clip_source = _get_segment_polydata(seg_node, SEG["temp_bolus_expanded"])
+        to_log("info", "  使用 bolus_expanded 边界匹配新阴模底面")
+    else:
+        clip_source = bolus_poly
+        to_log("warning", "  未找到 bolus_expanded，回退到 bolus 边界 (与新阴模可能错位)")
+
+    b = clip_source.GetBounds()
+    pad = skin_padding_mm   # 阴模 footprint 之外的额外余量
     bx = (b[1] - b[0]) + 2 * pad
     by = (b[3] - b[2]) + 2 * pad
     bz = 500.0
@@ -915,9 +947,21 @@ def execute_mold(config):
 
 
 def execute_validate(config):
-    """适形度评估: 计算阴模与 bolus 之间的 MHD/HD95/Dice/体积比/法兰RMS"""
+    """适形度评估: 比较 bolus 与「阴模内腔」并检查模具几何健康度
+
+    指标:
+      M1 MHD       bolus ↔ 阴模内表面双向平均距离
+      M2 HD95      bolus ↔ 阴模内表面双向 95% 分位距离
+      M3 Dice      bolus 体素 vs 反演内腔体素
+      M4 体积比    V_cavity / V_bolus
+      M5 mold∩skin 模具与皮肤的体素重叠 (= 0 才不会穿模)
+      M6 非流形边  模具拓扑必须封闭流形 (3D 打印前提)
+
+    阈值随上游 CT 体素分辨率自适应，避免对超出输入精度的指标做硬要求
+    """
     import slicer, vtk, numpy as np
     from vtk.util.numpy_support import vtk_to_numpy
+    from scipy.ndimage import distance_transform_edt
 
     d = config
     BOLUS_THICKNESS = d.get("thickness_mm", 5.0)
@@ -930,49 +974,43 @@ def execute_validate(config):
     if not seg_node or not seg_node.IsA("vtkMRMLSegmentationNode"):
         raise RuntimeError(f"未找到分割节点 '{SEG['node']}'，请先完成皮肤分割和补偿器设计")
 
+    vols = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
+    if not vols:
+        raise RuntimeError("场景中无体积数据，无法读取 CT 体素分辨率")
+    ct_min_spacing = max(min(vols[0].GetSpacing()), 0.1)
+
+    # 阈值随 CT 体素分辨率自适应：MHD 至少 0.7×voxel，HD95 至少 1.5×voxel
+    mhd_thr  = max(0.5, ct_min_spacing * 0.7)
+    hd95_thr = max(1.0, ct_min_spacing * 1.5)
+    overlap_thr_cm3 = 0.5  # 体素化抖动允许量
+
     # ── 内部辅助 ──
-    def _sample_poly(p, n=2000):
+    def _sample_poly(p, target_spacing):
         s = vtk.vtkPolyDataPointSampler()
         s.SetInputData(p)
-        s.SetDistance(p.GetLength() / n ** 0.5)
+        s.SetDistance(target_spacing)
         s.Update()
         return vtk_to_numpy(s.GetOutput().GetPoints().GetData())
 
-    def _nearest_dist(pts, tgt):
+    def _build_locator(p):
         loc = vtk.vtkCellLocator()
-        loc.SetDataSet(tgt)
+        loc.SetDataSet(p)
         loc.BuildLocator()
+        return loc
+
+    def _nearest_dist(pts, tgt_locator):
         c = [0., 0., 0.]
-        ci = vtk.reference(0)
-        si = vtk.reference(0)
-        d2 = vtk.reference(0.)
+        ci = vtk.reference(0); si = vtk.reference(0); d2 = vtk.reference(0.)
         d = np.empty(len(pts))
         for i, p in enumerate(pts):
-            loc.FindClosestPoint(p.tolist(), c, ci, si, d2)
+            tgt_locator.FindClosestPoint(p.tolist(), c, ci, si, d2)
             d[i] = d2 ** 0.5
         return d
 
-    def _calc_volume(p):
-        t = vtk.vtkTriangleFilter()
-        t.SetInputData(p)
-        t.Update()
-        m = vtk.vtkMassProperties()
-        m.SetInputData(t.GetOutput())
-        m.Update()
-        return m.GetVolume()
-
-    def _voxelize(p, sp=1.0, origin=None, dims=None):
-        if origin is None or dims is None:
-            b = p.GetBounds()
-            pad = sp * 2
-            origin = (b[0] - pad, b[2] - pad, b[4] - pad)
-            dims = (int((b[1] - b[0] + 2 * pad) / sp) + 1,
-                    int((b[3] - b[2] + 2 * pad) / sp) + 1,
-                    int((b[5] - b[4] + 2 * pad) / sp) + 1)
+    def _voxelize_3d(p, sp, origin, dims):
+        """光栅化 polydata 为 3D 布尔掩码 (z, y, x)"""
         img = vtk.vtkImageData()
-        img.SetOrigin(*origin)
-        img.SetSpacing(sp, sp, sp)
-        img.SetDimensions(*dims)
+        img.SetOrigin(*origin); img.SetSpacing(sp, sp, sp); img.SetDimensions(*dims)
         img.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, 1)
         stk = vtk.vtkPolyDataToImageStencil()
         stk.SetInputData(p)
@@ -983,13 +1021,20 @@ def execute_validate(config):
         st = vtk.vtkImageStencil()
         st.SetInputData(img)
         st.SetStencilData(stk.GetOutput())
-        st.ReverseStencilOn()
-        st.SetBackgroundValue(1)
-        st.Update()
-        return vtk_to_numpy(st.GetOutput().GetPointData().GetScalars()).astype(bool)
+        st.ReverseStencilOn(); st.SetBackgroundValue(1); st.Update()
+        flat = vtk_to_numpy(st.GetOutput().GetPointData().GetScalars()).astype(bool)
+        return flat.reshape((dims[2], dims[1], dims[0]))
 
-    # ── 加载数据 ──
-    to_log("info", "[1/4] 加载几何数据...")
+    def _bad_edges(p):
+        fe = vtk.vtkFeatureEdges()
+        fe.SetInputData(p)
+        fe.BoundaryEdgesOn(); fe.NonManifoldEdgesOn()
+        fe.FeatureEdgesOff(); fe.ManifoldEdgesOff()
+        fe.Update()
+        return fe.GetOutput().GetNumberOfCells()
+
+    # ── 加载几何 ──
+    to_log("info", "[1/5] 加载几何数据...")
     B = _get_segment_polydata(seg_node, bolus_name)
     S_poly = _get_segment_polydata(seg_node, SEG["skin"])
     female_node = slicer.mrmlScene.GetFirstNodeByName("Mold_Female_Conformal")
@@ -999,59 +1044,141 @@ def execute_validate(config):
     if not F or F.GetNumberOfPoints() == 0:
         raise RuntimeError("Mold_Female_Conformal 无几何数据")
 
-    to_log("info", "[2/4] 采样点云...")
-    pB = _sample_poly(B)
-    pF = _sample_poly(F)
+    # ── 几何健康检查 ──
+    to_log("info", "[2/5] 模具拓扑检查...")
+    n_bad_F = _bad_edges(F)
+    if n_bad_F > 0:
+        to_log("warning", f"  ⚠ 模具发现 {n_bad_F} 条非流形/开放边 (3D 打印可能失败)")
+    else:
+        to_log("info", "  ✓ 模具为封闭流形")
 
-    # ── M1 MHD & HD95 ──
-    to_log("info", "[3/4] 计算 MHD / HD95 / Dice / 体积比 / 法兰RMS...")
-    dBF = _nearest_dist(pB, F)
-    dFB = _nearest_dist(pF, B)
+    # ── 共享体素网格（含 skin，供 M5 使用） ──
+    to_log("info", "[3/5] 体素化 (共享网格 1mm，含 skin)...")
+    _sp = 1.0
+    _pad = max(_sp * 2, shell_mm + 2.0)
+    bB, bF, bS = B.GetBounds(), F.GetBounds(), S_poly.GetBounds()
+    _origin = (
+        min(bB[0], bF[0], bS[0]) - _pad,
+        min(bB[2], bF[2], bS[2]) - _pad,
+        min(bB[4], bF[4], bS[4]) - _pad,
+    )
+    _dims = (
+        int((max(bB[1], bF[1], bS[1]) + _pad - _origin[0]) / _sp) + 1,
+        int((max(bB[3], bF[3], bS[3]) + _pad - _origin[1]) / _sp) + 1,
+        int((max(bB[5], bF[5], bS[5]) + _pad - _origin[2]) / _sp) + 1,
+    )
+    vB = _voxelize_3d(B, _sp, _origin, _dims)
+    vF = _voxelize_3d(F, _sp, _origin, _dims)
+    vSkin = _voxelize_3d(S_poly, _sp, _origin, _dims)
+
+    # 反演阴模内腔: cavity = (bolus 膨胀 shell_mm 区域) - 阴模壳体 - 皮肤
+    # 注：& ~vSkin 让公式对新旧两种 mold 几何（穿模与不穿模）都鲁棒
+    dist_outside_B = distance_transform_edt(~vB, sampling=_sp)
+    vExpanded = dist_outside_B <= shell_mm   # bolus 内部 dist=0 已包含
+    vCavity = vExpanded & ~vF & ~vSkin
+
+    # ── 自适应密度采样 + 内表面过滤 ──
+    to_log("info", "[4/5] 表面采样 (自适应密度)...")
+    target_spacing = _sp * 1.5
+    pB = _sample_poly(B, target_spacing)
+    pF_all = _sample_poly(F, target_spacing)
+
+    F_loc = _build_locator(F)
+    B_loc = _build_locator(B)
+    dF_all = _nearest_dist(pF_all, B_loc)
+    inner_mask = dF_all < shell_mm * 0.4   # 收紧到 0.4 倍壁厚，避开侧壁
+    pF = pF_all[inner_mask]
+    dFB = dF_all[inner_mask]
+    if len(pF) < 50:
+        raise RuntimeError(f"阴模内表面采样点过少 ({len(pF)}/{len(pF_all)})，模具几何可能异常")
+    to_log("info", f"  采样: B={len(pB)}, F全表面={len(pF_all)} → 内表面={len(pF)} (间距 {target_spacing:.1f}mm)")
+
+    # ── 计算指标 ──
+    to_log("info", "[5/5] 计算 MHD / HD95 / Dice / 体积比 / mold∩skin...")
+    dBF = _nearest_dist(pB, F_loc)
     MHD = max(dBF.mean(), dFB.mean())
     HD95 = max(np.percentile(dBF, 95), np.percentile(dFB, 95))
 
-    # ── M2 Dice（体素 1mm，共享网格确保空间对齐） ──
-    _sp = 1.0
-    _pad = _sp * 2
-    bB, bF = B.GetBounds(), F.GetBounds()
-    _origin = (min(bB[0], bF[0]) - _pad, min(bB[2], bF[2]) - _pad, min(bB[4], bF[4]) - _pad)
-    _dims = (
-        int((max(bB[1], bF[1]) + _pad - _origin[0]) / _sp) + 1,
-        int((max(bB[3], bF[3]) + _pad - _origin[1]) / _sp) + 1,
-        int((max(bB[5], bF[5]) + _pad - _origin[2]) / _sp) + 1,
-    )
-    vB = _voxelize(B, sp=_sp, origin=_origin, dims=_dims)
-    vF = _voxelize(F, sp=_sp, origin=_origin, dims=_dims)
-    Dice = 2 * (vB & vF).sum() / (vB.sum() + vF.sum())
+    denom = vB.sum() + vCavity.sum()
+    Dice = 2 * (vB & vCavity).sum() / denom if denom > 0 else 0.0
 
-    # ── M3 体积比 R = V_cavity / V_bolus ──
-    vol_F = _calc_volume(F)
-    vol_B = _calc_volume(B)
-    t = vtk.vtkTriangleFilter()
-    t.SetInputData(B)
-    t.Update()
-    sa = vtk.vtkMassProperties()
-    sa.SetInputData(t.GetOutput())
-    sa.Update()
-    Ratio = (vol_F - sa.GetSurfaceArea() * shell_mm) / vol_B
+    vox_unit = _sp ** 3
+    vol_B = vB.sum() * vox_unit
+    vol_cavity = vCavity.sum() * vox_unit
+    Ratio = vol_cavity / vol_B if vol_B > 0 else 0.0
 
-    # ── M4 法兰 RMS 底边 5mm 内的点到皮肤面距离 ──
-    pAll = vtk_to_numpy(F.GetPoints().GetData())
-    flange = pAll[pAll[:, 2] < pAll[:, 2].min() + 5]
-    RMS = (_nearest_dist(flange, S_poly) ** 2).mean() ** 0.5
+    overlap_voxels = vF & vSkin
+    overlap_cm3 = overlap_voxels.sum() * vox_unit / 1000.0
+
+    # 穿模质心 → RAS 坐标 + 自动放置红色 Fiducial 方便临床定位
+    overlap_centroid_ras = None
+    fid_name = "Bolus_穿模警告"
+    existing_fid = slicer.mrmlScene.GetFirstNodeByName(fid_name)
+    if existing_fid:
+        slicer.mrmlScene.RemoveNode(existing_fid)
+    if overlap_voxels.any():
+        coords_zyx = np.argwhere(overlap_voxels)
+        cz, cy, cx = coords_zyx.mean(axis=0)
+        ras = (
+            _origin[0] + float(cx) * _sp,
+            _origin[1] + float(cy) * _sp,
+            _origin[2] + float(cz) * _sp,
+        )
+        overlap_centroid_ras = [round(v, 2) for v in ras]
+        fid = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", fid_name)
+        fid.AddControlPoint(*ras)
+        fid.SetNthControlPointLabel(0, f"穿模 {overlap_cm3:.2f}cm³")
+        disp = fid.GetDisplayNode()
+        if disp:
+            disp.SetSelectedColor(1.0, 0.2, 0.2)
+            disp.SetColor(1.0, 0.2, 0.2)
+            disp.SetGlyphScale(3.0)
+            disp.SetTextScale(3.5)
+
+        # 立即把 2D 视图跳转到穿模质心
+        try:
+            slicer.modules.markups.logic().JumpSlicesToLocation(ras[0], ras[1], ras[2], True)
+        except Exception as _e:
+            to_log("warning", f"  自动跳转 2D 视图失败: {_e}")
+
+        # 后续点击（shift+click）Fiducial 时自动跳转 2D 视图
+        if disp:
+            fid_id = fid.GetID()
+            def _jump_handler(caller, event, _fid_id=fid_id):
+                node = slicer.mrmlScene.GetNodeByID(_fid_id)
+                if node and node.GetNumberOfControlPoints() > 0:
+                    pos = [0.0, 0.0, 0.0]
+                    node.GetNthControlPointPositionWorld(0, pos)
+                    slicer.modules.markups.logic().JumpSlicesToLocation(pos[0], pos[1], pos[2], True)
+            try:
+                disp.AddObserver(slicer.vtkMRMLMarkupsDisplayNode.JumpToPointEvent, _jump_handler)
+            except Exception:
+                pass
+
+        to_log("warning", f"  ⚠ 穿模质心 RAS≈({ras[0]:.1f}, {ras[1]:.1f}, {ras[2]:.1f}) — 2D 视图已自动跳转，红点点击可再次跳转")
 
     # ── 判定 ──
-    ok = all([MHD < 0.5, HD95 < 1.0, Dice > 0.95, 0.95 < Ratio < 1.05, RMS < 0.5])
+    geom_ok = (n_bad_F == 0)
+    ok = all([
+        MHD < mhd_thr,
+        HD95 < hd95_thr,
+        Dice > 0.95,
+        0.95 < Ratio < 1.05,
+        overlap_cm3 < overlap_thr_cm3,
+        geom_ok,
+    ])
 
     lines = [
-        f"{'指标':<10} {'值':>8}   目标",
-        "─" * 36,
-        f"{'MHD':<10} {MHD:>7.3f}mm  <0.50    {'✓' if MHD < 0.50 else '✗'}",
-        f"{'HD95':<10} {HD95:>7.3f}mm  <1.00    {'✓' if HD95 < 1.00 else '✗'}",
-        f"{'Dice':<10} {Dice:>8.4f}  >0.95    {'✓' if Dice > 0.95 else '✗'}",
-        f"{'体积比':<10} {Ratio:>8.4f}  0.95~1.05 {'✓' if 0.95 < Ratio < 1.05 else '✗'}",
-        f"{'法兰RMS':<10} {RMS:>7.3f}mm  <0.50    {'✓' if RMS < 0.50 else '✗'}",
-        "─" * 36,
+        f"{'指标':<14} {'值':>10}    目标",
+        "─" * 52,
+        f"{'MHD':<14} {MHD:>9.3f}mm   <{mhd_thr:.2f}mm     {'✓' if MHD < mhd_thr else '✗'}",
+        f"{'HD95':<14} {HD95:>9.3f}mm   <{hd95_thr:.2f}mm     {'✓' if HD95 < hd95_thr else '✗'}",
+        f"{'Dice':<14} {Dice:>10.4f}   >0.95          {'✓' if Dice > 0.95 else '✗'}",
+        f"{'体积比':<14} {Ratio:>10.4f}   0.95~1.05      {'✓' if 0.95 < Ratio < 1.05 else '✗'}",
+        f"{'mold∩skin':<14} {overlap_cm3:>9.3f}cm³  <{overlap_thr_cm3:.2f}cm³    {'✓' if overlap_cm3 < overlap_thr_cm3 else '✗ 穿模'}",
+        f"{'非流形边':<14} {n_bad_F:>10d}    =0             {'✓' if geom_ok else '✗'}",
+        "─" * 52,
+        f"(CT 体素 {ct_min_spacing:.2f}mm，MHD/HD95 阈值已自适应)",
         f"{'✓ PASS' if ok else '✗ FAIL'}",
     ]
     for line in lines:
@@ -1066,7 +1193,18 @@ def execute_validate(config):
         "HD95_mm": round(HD95, 3),
         "Dice": round(Dice, 4),
         "volume_ratio": round(Ratio, 4),
-        "flange_RMS_mm": round(RMS, 3),
+        "mold_skin_overlap_cm3": round(overlap_cm3, 3),
+        "mold_skin_overlap_centroid_ras": overlap_centroid_ras,
+        "non_manifold_edges": int(n_bad_F),
+        "ct_voxel_min_mm": round(ct_min_spacing, 3),
+        "thresholds": {
+            "MHD_mm": round(mhd_thr, 3),
+            "HD95_mm": round(hd95_thr, 3),
+            "Dice": 0.95,
+            "volume_ratio_min": 0.95,
+            "volume_ratio_max": 1.05,
+            "overlap_cm3": overlap_thr_cm3,
+        },
     }]
 
 

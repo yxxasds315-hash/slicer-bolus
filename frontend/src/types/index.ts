@@ -24,13 +24,26 @@ export interface PipelineConfig {
 export type MoldStatus = 'idle' | 'running' | 'completed' | 'error';
 export type ValidateStatus = 'idle' | 'running' | 'completed' | 'error';
 
+export interface ValidateThresholds {
+  MHD_mm: number;
+  HD95_mm: number;
+  Dice: number;
+  volume_ratio_min: number;
+  volume_ratio_max: number;
+  overlap_cm3: number;
+}
+
 export interface ValidateResult {
   status: 'PASS' | 'FAIL';
   MHD_mm: number;
   HD95_mm: number;
   Dice: number;
   volume_ratio: number;
-  flange_RMS_mm: number;
+  mold_skin_overlap_cm3: number;
+  mold_skin_overlap_centroid_ras: [number, number, number] | null;
+  non_manifold_edges: number;
+  ct_voxel_min_mm: number;
+  thresholds: ValidateThresholds;
 }
 
 export interface LogEntry {
