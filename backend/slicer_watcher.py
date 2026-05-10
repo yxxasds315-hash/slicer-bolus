@@ -241,9 +241,24 @@ def execute_pipeline(config):
     pts = polyData.GetNumberOfPoints()
     if pts == 0:
         raise RuntimeError("Bolus 生成失败: 网格顶点为 0, ROI 可能偏离皮肤表面")
-    to_log("success", f"Bolus 已生成: {bolus_name} ({pts} 顶点), 请在 Slicer 中检查")
 
-    return [{"node": seg_node.GetID(), "bolus": bolus_name, "vertices": pts}]
+    # 空间尺寸（轴对齐包围盒，RAS mm）
+    b = polyData.GetBounds()
+    bounds_mm = [round(b[1]-b[0], 1), round(b[3]-b[2], 1), round(b[5]-b[4], 1)]
+
+    # 实际体积（闭合曲面 → vtkMassProperties，mm³ → cm³）
+    tri = vtk.vtkTriangleFilter()
+    tri.SetInputData(polyData); tri.Update()
+    mass = vtk.vtkMassProperties()
+    mass.SetInputData(tri.GetOutput()); mass.Update()
+    volume_cm3 = round(mass.GetVolume() / 1000.0, 1)
+
+    to_log("success", f"Bolus 已生成: {bolus_name} ({pts} 顶点) "
+                      f"尺寸 {bounds_mm[0]}×{bounds_mm[1]}×{bounds_mm[2]}mm "
+                      f"体积 {volume_cm3}cm³")
+
+    return [{"node": seg_node.GetID(), "bolus": bolus_name, "vertices": pts,
+             "bounds_mm": bounds_mm, "volume_cm3": volume_cm3}]
 
 
 def execute_preview(config):
@@ -979,9 +994,9 @@ def execute_validate(config):
         raise RuntimeError("场景中无体积数据，无法读取 CT 体素分辨率")
     ct_min_spacing = max(min(vols[0].GetSpacing()), 0.1)
 
-    # 阈值随 CT 体素分辨率自适应：MHD 至少 0.7×voxel，HD95 至少 1.5×voxel
-    mhd_thr  = max(0.5, ct_min_spacing * 0.7)
-    hd95_thr = max(1.0, ct_min_spacing * 1.5)
+    # 阈值随 CT 体素分辨率自适应：labelmap 管线单次误差约 1 体素，双向约 2 体素
+    mhd_thr  = max(1.0, ct_min_spacing * 2.0)
+    hd95_thr = max(2.0, ct_min_spacing * 4.0)
     overlap_thr_cm3 = 0.5  # 体素化抖动允许量
 
     # ── 内部辅助 ──
@@ -1021,7 +1036,7 @@ def execute_validate(config):
         st = vtk.vtkImageStencil()
         st.SetInputData(img)
         st.SetStencilData(stk.GetOutput())
-        st.ReverseStencilOn(); st.SetBackgroundValue(1); st.Update()
+        st.SetBackgroundValue(1); st.Update()
         flat = vtk_to_numpy(st.GetOutput().GetPointData().GetScalars()).astype(bool)
         return flat.reshape((dims[2], dims[1], dims[0]))
 

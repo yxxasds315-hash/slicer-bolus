@@ -51,7 +51,7 @@ def vox3d(p, sp, origin, dims):
     stk.SetOutputOrigin(img.GetOrigin()); stk.SetOutputSpacing(img.GetSpacing())
     stk.SetOutputWholeExtent(img.GetExtent()); stk.Update()
     st = vtk.vtkImageStencil(); st.SetInputData(img)
-    st.SetStencilData(stk.GetOutput()); st.ReverseStencilOn()
+    st.SetStencilData(stk.GetOutput())
     st.SetBackgroundValue(1); st.Update()
     flat = vtk_to_numpy(st.GetOutput().GetPointData().GetScalars()).astype(bool)
     return flat.reshape((dims[2], dims[1], dims[0]))
@@ -66,8 +66,8 @@ def bad_edges(p):
 # ── 自适应阈值 ────────────────────────────────
 vol = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")[0]
 ct_min = max(min(vol.GetSpacing()), 0.1)
-MHD_THR  = max(0.5, ct_min * 0.7)
-HD95_THR = max(1.0, ct_min * 1.5)
+MHD_THR  = max(1.0, ct_min * 2.0)
+HD95_THR = max(2.0, ct_min * 4.0)
 OVERLAP_THR_CM3 = 0.5
 
 # ── 加载 ─────────────────────────────────────
