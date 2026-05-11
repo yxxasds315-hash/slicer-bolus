@@ -67,6 +67,15 @@ function MoldIcon({ className = S }: IconProps) {
   );
 }
 
+function ValidateIcon({ className = S }: IconProps) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+      <polyline points="22 4 12 14.01 9 11.01" />
+    </svg>
+  );
+}
+
 function ExportIcon({ className = S }: IconProps) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
@@ -80,5 +89,5 @@ function ExportIcon({ className = S }: IconProps) {
 
 export const STEP_ICONS: Record<number, (p: IconProps) => JSX.Element> = {
   1: DicomIcon, 2: SkinIcon, 3: RoiIcon, 4: BolusIcon,
-  5: ExecuteIcon, 6: MoldIcon, 7: ExportIcon,
+  5: ExecuteIcon, 6: MoldIcon, 7: ValidateIcon, 8: ExportIcon,
 };

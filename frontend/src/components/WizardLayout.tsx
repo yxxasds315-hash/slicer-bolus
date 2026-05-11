@@ -69,7 +69,8 @@ const steps: StepInfo[] = [
   { id: 4, label: '补偿器设计', Icon: STEP_ICONS[4] },
   { id: 5, label: '执行',       Icon: STEP_ICONS[5] },
   { id: 6, label: '模具设计',   Icon: STEP_ICONS[6] },
-  { id: 7, label: '导出 STL',   Icon: STEP_ICONS[7] },
+  { id: 7, label: '适形度评估', Icon: STEP_ICONS[7] },
+  { id: 8, label: '导出 STL',   Icon: STEP_ICONS[8] },
 ];
 
 export function WizardLayout({ children, currentStep, totalSteps: _ts, onNext, onPrev, canNext, isLast, status, slicer, slicerOnline, onReconnect, connecting, onJumpToStep, devMode }: WizardLayoutProps) {

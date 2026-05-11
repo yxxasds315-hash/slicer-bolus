@@ -1,13 +1,36 @@
-import type { PipelineConfig, PipelineStatus, LogEntry, SlicerState } from '../types';
+import type { PipelineConfig, PipelineStatus, LogEntry, SlicerState, BolusInfo } from '../types';
 
-interface ExecutionPanelProps { config: PipelineConfig; status: PipelineStatus; logs: LogEntry[]; onExecute: () => void; slicer?: SlicerState; }
+interface ExecutionPanelProps { config: PipelineConfig; status: PipelineStatus; logs: LogEntry[]; onExecute: () => void; slicer?: SlicerState; bolusInfo?: BolusInfo | null; }
 
-export function ExecutionPanel({ config, status, logs }: ExecutionPanelProps) {
+export function ExecutionPanel({ config, status, logs, bolusInfo }: ExecutionPanelProps) {
   const renderStatus = () => {
     switch (status) {
       case 'idle': return (<div className="text-center py-8"><div className="text-4xl mb-3">🚀</div><p className="text-medical-400 text-sm">所有参数已就绪，点击下方按钮启动处理</p></div>);
       case 'running': return (<div className="text-center py-4"><div className="animate-spin inline-block w-8 h-8 border-2 border-accent-400 border-t-transparent rounded-full mb-3" /><p className="text-accent-300 text-sm">处理中，请稍候...</p></div>);
-      case 'completed': return (<div className="text-center py-8"><div className="text-4xl mb-3">✅</div><p className="text-success text-sm">处理完成！STL 文件已导出到输出目录。</p></div>);
+      case 'completed': return (
+        <div className="space-y-3">
+          <div className="text-center py-4">
+            <div className="text-4xl mb-2">✅</div>
+            <p className="text-success text-sm font-medium">补偿器设计完成</p>
+          </div>
+          {bolusInfo && (
+            <div className="bg-medical-900/60 border border-accent-400/30 rounded-lg p-4 space-y-2">
+              <p className="text-xs font-medium text-accent-300 uppercase tracking-wider">{bolusInfo.bolus}</p>
+              <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
+                <span className="text-medical-400">空间尺寸</span>
+                <span className="font-mono text-medical-200">
+                  {bolusInfo.bounds_mm[0]} × {bolusInfo.bounds_mm[1]} × {bolusInfo.bounds_mm[2]} mm
+                </span>
+                <span className="text-medical-400">实际体积</span>
+                <span className="font-mono text-medical-200">
+                  {bolusInfo.volume_cm3} cm³
+                  <span className="text-medical-500 text-xs ml-1">(≈ {bolusInfo.volume_cm3} mL)</span>
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+      );
       case 'error': return (<div className="text-center py-8"><div className="text-4xl mb-3">❌</div><p className="text-danger text-sm">处理出错，请查看日志了解详情。</p></div>);
     }
   };

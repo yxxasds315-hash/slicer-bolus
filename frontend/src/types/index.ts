@@ -10,15 +10,16 @@ export interface PipelineConfig {
   seal_kernel_1_mm: number;
   seal_kernel_2_mm: number;
   mold_shell_thickness_mm: number;
-  mold_base_thickness_mm: number;
-  mold_skin_padding_mm: number;
-  mold_pin_radius_mm: number;
-  mold_pin_height_mm: number;
-  mold_pin_clearance_mm: number;
-  mold_with_pins: boolean;
   mold_sprue_radius_mm: number;
   mold_vent_radius_mm: number;
   mold_with_sprue: boolean;
+}
+
+export interface BolusInfo {
+  bolus: string;
+  vertices: number;
+  bounds_mm: [number, number, number];
+  volume_cm3: number;
 }
 
 export type MoldStatus = 'idle' | 'running' | 'completed' | 'error';

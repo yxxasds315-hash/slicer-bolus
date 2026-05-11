@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import type { PipelineConfig, LogEntry, PipelineStatus, SlicerState, MoldStatus, ValidateStatus, ValidateResult } from './types';
+import type { PipelineConfig, LogEntry, PipelineStatus, SlicerState, MoldStatus, ValidateStatus, ValidateResult, BolusInfo } from './types';
 import { WizardLayout } from './components/WizardLayout';
 import { DicomSelector } from './components/DicomSelector';
 import { SegmentationPanel, type PreviewStatus } from './components/SegmentationPanel';
@@ -21,12 +21,6 @@ const defaultConfig: PipelineConfig = {
   seal_kernel_1_mm: 15.0,
   seal_kernel_2_mm: 8.0,
   mold_shell_thickness_mm: 4.0,
-  mold_base_thickness_mm: 2.5,
-  mold_skin_padding_mm: 6.0,
-  mold_pin_radius_mm: 2.0,
-  mold_pin_height_mm: 8.0,
-  mold_pin_clearance_mm: 0.20,
-  mold_with_pins: true,
   mold_sprue_radius_mm: 3.0,
   mold_vent_radius_mm: 1.0,
   mold_with_sprue: true,
@@ -51,6 +45,7 @@ export default function App() {
   const [validateStatus, setValidateStatus] = useState<ValidateStatus>('idle');
   const [validateResult, setValidateResult] = useState<ValidateResult | null>(null);
   const [validateError, setValidateError] = useState('');
+  const [bolusInfo, setBolusInfo] = useState<BolusInfo | null>(null);
   const [jumpMsg, setJumpMsg] = useState('');
   const [pipelineThickness, setPipelineThickness] = useState<number | null>(() => {
     const v = sessionStorage.getItem('pipelineThickness');
@@ -124,7 +119,20 @@ export default function App() {
   const handleNext = () => { if (step === 5 && pipeStatus !== 'completed') { executePipeline(); return; } setStep((s) => Math.min(s + 1, 8)); };
   const addLocalLog = (level: LogEntry['level'], msg: string) => setLocalLogs((p) => [...p, { timestamp: new Date().toLocaleTimeString(), level, message: msg }]);
 
-  const executePipeline = async () => { setPipeStatus('running'); setLocalLogs([]); clearLogs(); addLocalLog('info', 'Starting pipeline...'); try { const r = await fetch('/api/execute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...config, use_existing_volumes: config.dicom_dir === '__slicer__' }) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || 'Failed'); } const d = await r.json(); addLocalLog('success', `Done! ${d.output_files?.join(', ') || ''}`); setPipeStatus('completed'); setPipelineThickness(config.thickness_mm); sessionStorage.setItem('pipelineThickness', String(config.thickness_mm)); } catch (err: any) { addLocalLog('error', err.message); setPipeStatus('error'); } };
+  const executePipeline = async () => {
+    setPipeStatus('running'); setBolusInfo(null); setLocalLogs([]); clearLogs();
+    addLocalLog('info', 'Starting pipeline...');
+    try {
+      const r = await fetch('/api/execute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...config, use_existing_volumes: config.dicom_dir === '__slicer__' }) });
+      if (!r.ok) { const e = await r.json(); throw new Error(e.detail || 'Failed'); }
+      const d = await r.json();
+      const info = d.output_files?.[0];
+      if (info?.bounds_mm && info?.volume_cm3 != null) setBolusInfo(info as BolusInfo);
+      addLocalLog('success', `Done! ${info?.bolus || ''}`);
+      setPipeStatus('completed'); setPipelineThickness(config.thickness_mm);
+      sessionStorage.setItem('pipelineThickness', String(config.thickness_mm));
+    } catch (err: any) { addLocalLog('error', err.message); setPipeStatus('error'); }
+  };
 
   const canJumpToStep = (target: number): string | null => {
     if (target <= 1) return null;
@@ -163,18 +171,18 @@ export default function App() {
   const handlePrev = () => {
     const prev = Math.max(step - 1, 1);
     setStep(prev);
-    if (step === 5) setPipeStatus('idle');
+    if (step === 5) { setPipeStatus('idle'); setBolusInfo(null); }
     if (step === 6) setMoldStatus('idle');
     if (step === 7) setValidateStatus('idle');
   };
 
   const renderStep = () => {
     switch (step) {
-      case 1: return <DicomSelector config={config} onChange={updateConfig} slicer={slicer} />;
+      case 1: return <DicomSelector config={config} onChange={updateConfig} slicer={slicer} onJumpToStep={handleJumpToStep} />;
       case 2: return <SegmentationPanel config={config} onChange={updateConfig} onPreview={handlePreview} onScissors={handleScissors} onSolidify={handleSolidify} onSeal={handleSeal} onFinalize={handleFinalize} previewStatus={previewStatus} previewError={previewError} />;
       case 3: return <RoiSelector config={config} onChange={updateConfig} slicer={slicer} />;
       case 4: return <BolusDesigner config={config} onChange={updateConfig} />;
-      case 5: return <ExecutionPanel config={config} status={pipeStatus} logs={logs} onExecute={executePipeline} slicer={slicer} />;
+      case 5: return <ExecutionPanel config={config} status={pipeStatus} logs={logs} onExecute={executePipeline} slicer={slicer} bolusInfo={bolusInfo} />;
       case 6: return <MoldGenerator config={config} onChange={updateConfig} onGenerate={handleMold} moldStatus={moldStatus} moldError={moldError} />;
       case 7: return <ValidatePanel config={config} onValidate={handleValidate} validateStatus={validateStatus} validateResult={validateResult} validateError={validateError} />;
       case 8: return <ExportPanel config={config} onChange={updateConfig} slicer={slicer} />;
