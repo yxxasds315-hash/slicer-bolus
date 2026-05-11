@@ -54,7 +54,7 @@ def vox3d(p, sp, origin, dims):
     st.SetStencilData(stk.GetOutput())
     st.SetBackgroundValue(1); st.Update()
     flat = vtk_to_numpy(st.GetOutput().GetPointData().GetScalars()).astype(bool)
-    return flat.reshape((dims[2], dims[1], dims[0]))
+    return ~flat.reshape((dims[2], dims[1], dims[0]))  # SetBackgroundValue(1) → outside=1, invert to get True=inside
 
 def bad_edges(p):
     fe = vtk.vtkFeatureEdges(); fe.SetInputData(p)
@@ -92,10 +92,13 @@ vB = vox3d(B, sp, origin, dims)
 vF = vox3d(F, sp, origin, dims)
 vSkin = vox3d(S, sp, origin, dims)
 
-# 反演阴模内腔（& ~vSkin 让公式对穿模/不穿模两种 mold 都鲁棒）
+# vExpanded = bolus 向外膨胀 SHELL_MM 的区域（bolus 内部 + 外表面 SHELL_MM 壳）
+# ~vB 作为前景：scipy EDT 对 True 像素计算到最近 False 像素的距离，即外部到 bolus 表面的距离
 dist_outside_B = distance_transform_edt(~vB, sampling=sp)
 vExpanded = dist_outside_B <= SHELL_MM
-vCavity = vExpanded & ~vF & ~vSkin
+# 预期腔体 = bolus 外表面 SHELL_MM 厚的壳，位于患者体外
+# 不使用 ~vF：阴模内腔本身包裹 bolus，~vF 会将 bolus 所在区域排除导致 Dice=0
+vCavity = vExpanded & ~vB & ~vSkin
 
 # ── 自适应密度采样 + 内表面过滤 ────────────────
 target_spacing = sp * 1.5
