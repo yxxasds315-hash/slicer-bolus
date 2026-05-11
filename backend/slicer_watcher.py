@@ -715,15 +715,21 @@ def _apply_margin_to_segment(seg_node, segment_name, margin_mm, new_name):
 
 
 def _make_cylinder_poly(cx, cy, cz, radius, height, resolution=32):
+    """生成沿 Z 轴的圆柱，中心位于 (cx, cy, cz)。
+
+    vtkCylinderSource 默认沿 Y 轴。先在原点生成，再旋转为 Z 轴，最后平移到目标位置；
+    顺序很关键——若先 SetCenter 再 RotateX，世界原点旋转会把圆柱甩出预期位置。
+    """
     cyl = vtk.vtkCylinderSource()
-    cyl.SetCenter(cx, cy, cz)
     cyl.SetRadius(radius)
     cyl.SetHeight(height)
     cyl.SetResolution(resolution)
     cyl.CappingOn()
     cyl.Update()
     transform = vtk.vtkTransform()
+    transform.PostMultiply()
     transform.RotateX(90)
+    transform.Translate(cx, cy, cz)
     tf_filter = vtk.vtkTransformPolyDataFilter()
     tf_filter.SetInputData(cyl.GetOutput())
     tf_filter.SetTransform(transform)
@@ -818,13 +824,36 @@ def _add_sprue_and_vents(female_poly, sprue_radius_mm, vent_radius_mm):
     cy = (b[2] + b[3]) / 2
     cz = (b[4] + b[5]) / 2
     h_thru = (b[5] - b[4]) + 4
+
+    # 排气孔偏移按模具 X 尺寸自适应，避免小模具上偏移过大错过本体
+    x_span = b[1] - b[0]
+    vent_offset = min(20.0, x_span * 0.35)
+    if vent_offset < sprue_radius_mm + vent_radius_mm + 1.0:
+        to_log("warning", f"  ⚠ 模具 X 跨度 {x_span:.1f}mm 过小，跳过排气孔（仅保留注料口）")
+        skip_vents = True
+    else:
+        skip_vents = False
+
     sprue = _make_cylinder_poly(cx, cy, cz, sprue_radius_mm, h_thru)
-    vent1 = _make_cylinder_poly(cx + 20, cy, cz, vent_radius_mm, h_thru)
-    vent2 = _make_cylinder_poly(cx - 20, cy, cz, vent_radius_mm, h_thru)
     result = _poly_boolean(female_poly, sprue, "difference")
-    result = _poly_boolean(result, vent1, "difference")
-    result = _poly_boolean(result, vent2, "difference")
-    to_log("info", f"  [注料口] r={sprue_radius_mm}mm | [排气孔] r={vent_radius_mm}mm ×2")
+    if result.GetNumberOfPoints() == 0:
+        raise RuntimeError("注料口布尔运算失败（结果为空）")
+
+    if not skip_vents:
+        vent1 = _make_cylinder_poly(cx + vent_offset, cy, cz, vent_radius_mm, h_thru)
+        vent2 = _make_cylinder_poly(cx - vent_offset, cy, cz, vent_radius_mm, h_thru)
+        r1 = _poly_boolean(result, vent1, "difference")
+        if r1.GetNumberOfPoints() == 0:
+            to_log("warning", "  ⚠ 排气孔 1 布尔失败，保留前一步结果")
+        else:
+            result = r1
+        r2 = _poly_boolean(result, vent2, "difference")
+        if r2.GetNumberOfPoints() == 0:
+            to_log("warning", "  ⚠ 排气孔 2 布尔失败，保留前一步结果")
+        else:
+            result = r2
+
+    to_log("info", f"  [注料口] r={sprue_radius_mm}mm | [排气孔] r={vent_radius_mm}mm 偏移±{vent_offset:.1f}mm")
     return result
 
 
@@ -850,6 +879,11 @@ def execute_mold(config):
     shell_mm = d.get("mold_shell_thickness_mm", 4.0)
     sprue_r  = d.get("mold_sprue_radius_mm", 3.0)
     vent_r   = d.get("mold_vent_radius_mm", 1.0)
+
+    # 清理上一次生成的同名节点，避免重复生成时累积 _1/_2 后缀导致导出错乱
+    for old in list(slicer.util.getNodesByClass("vtkMRMLModelNode")):
+        if old.GetName().startswith("Mold_Female_Conformal"):
+            slicer.mrmlScene.RemoveNode(old)
 
     female = _make_female_mold(seg_node, bolus_name, SEG["skin"], shell_mm)
 
