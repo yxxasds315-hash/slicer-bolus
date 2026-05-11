@@ -652,7 +652,6 @@ def _poly_boolean(poly_a, poly_b, operation):
         norm = vtk.vtkPolyDataNormals()
         norm.SetInputData(tri.GetOutput())
         norm.ConsistencyOn()
-        norm.AutoOrientNormalsOn()
         norm.Update()
         return norm.GetOutput()
 
@@ -796,7 +795,8 @@ def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm):
 
     norm = vtk.vtkPolyDataNormals()
     norm.SetInputData(female_poly)
-    norm.ConsistencyOn(); norm.AutoOrientNormalsOn(); norm.SplittingOff()
+    norm.ConsistencyOn()
+    norm.SplittingOff()
     norm.Update()
     female_poly = norm.GetOutput()
 
