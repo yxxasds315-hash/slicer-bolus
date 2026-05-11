@@ -78,6 +78,12 @@ cd frontend && npx vite --host 0.0.0.0
 ### 功能
 - **`hollow` 方法未验证**：代码存在于 `execute_pipeline`，但从未端到端运行过。UI 上可选，实际效果不明。需在 Slicer 中手动验证后更新 README。
 
+### 模具生成（2026-05-12 深审遗留风险）
+- **Margin 体素化精度损失**：Slicer Margin 效果按体素膨胀，4mm shell 在 3mm CT 体素上只膨胀 1 体素 ≈ 3mm，实际壳厚比设定值少 ~25%。需在 Slicer 中实测后决定是否补偿（如设 5mm 输入换 4mm 实际厚度）。
+- **单片封闭模具无脱模设计**：模具仅一个 sprue 孔，硅胶硬化后取不出 bolus。当前用法假设：① 柔性 TPU 打印后撕开，② 一次性切开。若临床要重复使用，需要加分模面或两瓣式设计。
+- **底板与皮肤段重叠**：`expanded - bolus` 让模具底板深入 skin 体素空间 shell_mm 深度。浇铸场景无影响（mold 离体使用）；若要把 mold 直接戴在患者身上做治疗，底板会和皮肤冲突。需明确临床流程。
+- **方向假设 Z 朝上**：sprue 与 vent 默认沿 Z 轴穿透模具中心。头顶 bolus 正确；侧脸/腹部 bolus 方向错误，sprue 不在重力上方，硅胶会从错误位置溢出。需根据 bolus 法线方向自适应或加用户朝向控制。
+
 ### 工程质量
 - **无自动化测试**：`test_http.py` 无断言，`test_phantom.py` 需手动粘贴到 Slicer Console。无法做回归保护。
 - **`test_http.py` 仅打印不断言**：`test_health()` / `test_status()` 缺少 assert，不能用于 CI。
