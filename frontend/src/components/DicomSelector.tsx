@@ -1,4 +1,3 @@
-import { useState } from 'react';
 import { useBrowseFolder } from '../hooks/useBrowseFolder';
 import type { PipelineConfig, SlicerState } from '../types';
 
@@ -6,57 +5,13 @@ interface Props {
   config: PipelineConfig;
   onChange: (p: Partial<PipelineConfig>) => void;
   slicer?: SlicerState;
-  onJumpToStep?: (target: number) => void;
 }
 
-export function DicomSelector({ config, onChange, slicer, onJumpToStep }: Props) {
+export function DicomSelector({ config, onChange, slicer }: Props) {
   const { browse, browsing } = useBrowseFolder();
-  const [phantomStatus, setPhantomStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
-  const [phantomError, setPhantomError] = useState('');
-
-  const loadBoxPhantom = async () => {
-    setPhantomStatus('running'); setPhantomError('');
-    try {
-      const r = await fetch('/api/test/box_phantom', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ thickness_mm: config.thickness_mm || 5.0 }),
-      });
-      if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '测试体模载入失败'); }
-      setPhantomStatus('done');
-      // 等 slicer 状态轮询刷新（1s/次），再尝试跳到第 6 步
-      if (onJumpToStep) {
-        setTimeout(() => onJumpToStep(6), 1500);
-      }
-    } catch (err: any) {
-      setPhantomStatus('error'); setPhantomError(err.message);
-    }
-  };
 
   return (
     <div className="space-y-4">
-      <div className="bg-amber-900/20 border border-amber-700/40 rounded-lg p-3 space-y-2">
-        <div className="flex items-center justify-between gap-3">
-          <div className="flex-1">
-            <h4 className="text-xs font-bold text-amber-300 uppercase tracking-wider">🧪 测试模式（跳过 DICOM）</h4>
-            <p className="text-xs text-amber-200/70 mt-0.5">载入 20×20×{config.thickness_mm || 5}mm 长方体 + 平面皮肤，用于验证模具/评估逻辑。载入成功后自动跳到第 6 步。</p>
-          </div>
-          <button
-            onClick={loadBoxPhantom}
-            disabled={phantomStatus === 'running'}
-            className="px-3 py-1.5 bg-amber-600 text-medical-900 rounded text-xs font-bold hover:bg-amber-500 disabled:opacity-50 transition-colors whitespace-nowrap"
-          >
-            {phantomStatus === 'running' ? '载入中…' : phantomStatus === 'done' ? '✓ 已载入' : '载入长方体'}
-          </button>
-        </div>
-        {phantomStatus === 'error' && (
-          <p className="text-xs text-danger">{phantomError}</p>
-        )}
-        {phantomStatus === 'done' && (
-          <p className="text-xs text-amber-200/80">✓ BoxPhantomVolume + Skin + Bolus_{config.thickness_mm || 5}mm 已就绪</p>
-        )}
-      </div>
-
       {slicer && slicer.volumes.length > 0 && (
         <div className="bg-success/10 border border-success/30 rounded-lg p-4">
           <h3 className="text-sm font-medium text-success mb-2">✅ Slicer 中已有患者数据</h3>

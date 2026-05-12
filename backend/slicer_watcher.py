@@ -906,101 +906,6 @@ def execute_mold(config):
     return [{"node": "Mold_Female_Conformal", "type": "female", "vertices": female.GetNumberOfPoints()}]
 
 
-def execute_load_box_phantom(config):
-    """加载 20×20×5mm 长方体测试体模 (Skin + Bolus 一并创建，跳过 execute_pipeline)
-
-    用于绕过 EDT 全皮肤覆盖逻辑，验证模具生成对已知精确几何的行为。
-    创建的 Bolus_5.0mm 段可直接被 execute_mold 使用。
-    """
-    import slicer, vtk, numpy as np
-
-    d = config or {}
-    spacing       = float(d.get("box_spacing_mm", 1.0))
-    vol_mm        = float(d.get("box_vol_mm", 80.0))
-    bolus_x_mm    = float(d.get("box_bolus_x_mm", 20.0))
-    bolus_y_mm    = float(d.get("box_bolus_y_mm", 20.0))
-    bolus_z_mm    = float(d.get("thickness_mm", 5.0))
-
-    bolus_name = _bolus_name(bolus_z_mm)
-    to_log("info", f"========== 长方体测试体模: {bolus_x_mm}×{bolus_y_mm}×{bolus_z_mm}mm ==========")
-
-    # 清理旧节点
-    for name in [SEG["node"], "BoxPhantomVolume"]:
-        old = slicer.mrmlScene.GetFirstNodeByName(name)
-        if old:
-            slicer.mrmlScene.RemoveNode(old)
-            to_log("info", f"  [清理] {name}")
-
-    # 体积
-    n = int(vol_mm / spacing) + 1
-    skin_top_k = n // 2
-    vol_arr = np.full((n, n, n), -1000, dtype=np.int16)
-    vol_arr[:skin_top_k, :, :] = 40
-
-    vol_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", "BoxPhantomVolume")
-    slicer.util.updateVolumeFromArray(vol_node, vol_arr)
-    vol_node.SetSpacing(spacing, spacing, spacing)
-    ijk2ras = vtk.vtkMatrix4x4(); ijk2ras.Identity()
-    half = vol_mm / 2.0
-    for i in range(3):
-        ijk2ras.SetElement(i, 3, -half)
-    vol_node.SetIJKToRASMatrix(ijk2ras)
-    slicer.util.setSliceViewerLayers(background=vol_node)
-    to_log("info", f"  [体积] BoxPhantomVolume ({n}³ vox @ {spacing}mm)")
-
-    # 分割
-    seg_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", SEG["node"])
-    seg_node.CreateDefaultDisplayNodes()
-    seg_node.SetReferenceImageGeometryParameterFromVolumeNode(vol_node)
-    seg = seg_node.GetSegmentation()
-
-    # Skin (下半体积)
-    skin_arr = np.zeros((n, n, n), dtype=np.int8)
-    skin_arr[:skin_top_k, :, :] = 1
-    skin_id = seg.AddEmptySegment(SEG["skin"], SEG["skin"], (0.2, 0.8, 0.3))
-    slicer.util.updateSegmentBinaryLabelmapFromArray(skin_arr, seg_node, skin_id, vol_node)
-    to_log("info", f"  [皮肤] {SEG['skin']}: 平面 (下半 {int(skin_arr.sum()):,} vox)")
-
-    # Bolus (20×20×5mm 长方体)
-    cx = cy = n // 2
-    dz  = int(round(bolus_z_mm / spacing))
-    dxy_x = int(round(bolus_x_mm / 2 / spacing))
-    dxy_y = int(round(bolus_y_mm / 2 / spacing))
-    bolus_arr = np.zeros((n, n, n), dtype=np.int8)
-    zlo, zhi = skin_top_k, skin_top_k + dz
-    ylo, yhi = cy - dxy_y, cy + dxy_y
-    xlo, xhi = cx - dxy_x, cx + dxy_x
-    bolus_arr[zlo:zhi, ylo:yhi, xlo:xhi] = 1
-
-    bolus_id = seg.AddEmptySegment(bolus_name, bolus_name, (0.2, 0.6, 0.9))
-    slicer.util.updateSegmentBinaryLabelmapFromArray(bolus_arr, seg_node, bolus_id, vol_node)
-
-    vox = int(bolus_arr.sum())
-    expected_cm3 = bolus_x_mm * bolus_y_mm * bolus_z_mm / 1000.0
-    actual_cm3   = vox * (spacing ** 3) / 1000.0
-    to_log("info", f"  [Bolus] {bolus_name}: {vox} vox = {actual_cm3:.3f} cm³ (预期 {expected_cm3:.3f} cm³)")
-
-    seg_node.CreateClosedSurfaceRepresentation()
-    disp = seg_node.GetDisplayNode()
-    disp.SetVisibility3D(True); disp.SetOpacity3D(0.55)
-
-    lm = slicer.app.layoutManager()
-    lm.setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
-    for i in range(lm.threeDViewCount):
-        lm.threeDWidget(i).threeDView().resetFocalPoint()
-
-    to_log("success", f"测试体模载入完成 — 可直接执行模具生成 (跳过 execute_pipeline)")
-
-    return [{
-        "node": seg_node.GetID(),
-        "volume": vol_node.GetID(),
-        "bolus_segment": bolus_name,
-        "skin_segment": SEG["skin"],
-        "bolus_volume_cm3": round(actual_cm3, 3),
-        "expected_volume_cm3": round(expected_cm3, 3),
-    }]
-
-
 def execute_validate(config):
     """适形度评估: 比较 bolus 与「阴模内腔」并检查模具几何健康度
 
@@ -1352,8 +1257,6 @@ def tick():
                 pending_job = lambda c=cfg: execute_export(c["config"])
             elif action == "validate":
                 pending_job = lambda c=cfg: execute_validate(c["config"])
-            elif action == "load_box_phantom":
-                pending_job = lambda c=cfg: execute_load_box_phantom(c["config"])
             else:
                 pending_job = lambda c=cfg: execute_pipeline(c["config"])
 

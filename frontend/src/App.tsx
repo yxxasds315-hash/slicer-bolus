@@ -176,7 +176,7 @@ export default function App() {
 
   const renderStep = () => {
     switch (step) {
-      case 1: return <DicomSelector config={config} onChange={updateConfig} slicer={slicer} onJumpToStep={handleJumpToStep} />;
+      case 1: return <DicomSelector config={config} onChange={updateConfig} slicer={slicer} />;
       case 2: return <SegmentationPanel config={config} onChange={updateConfig} onPreview={handlePreview} onScissors={handleScissors} onSolidify={handleSolidify} onSeal={handleSeal} onFinalize={handleFinalize} previewStatus={previewStatus} previewError={previewError} />;
       case 3: return <RoiSelector config={config} onChange={updateConfig} slicer={slicer} />;
       case 4: return <BolusDesigner config={config} onChange={updateConfig} />;
