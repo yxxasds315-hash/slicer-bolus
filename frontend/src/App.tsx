@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import type { PipelineConfig, LogEntry, PipelineStatus, SlicerState, MoldStatus, ValidateStatus, ValidateResult } from './types';
+import type { PipelineConfig, LogEntry, PipelineStatus, SlicerState, MoldStatus, ValidateStatus, ValidateResult, BolusInfo } from './types';
 import { WizardLayout } from './components/WizardLayout';
 import { DicomSelector } from './components/DicomSelector';
 import { SegmentationPanel, type PreviewStatus } from './components/SegmentationPanel';
@@ -21,12 +21,6 @@ const defaultConfig: PipelineConfig = {
   seal_kernel_1_mm: 15.0,
   seal_kernel_2_mm: 8.0,
   mold_shell_thickness_mm: 4.0,
-  mold_base_thickness_mm: 2.5,
-  mold_skin_padding_mm: 6.0,
-  mold_pin_radius_mm: 2.0,
-  mold_pin_height_mm: 8.0,
-  mold_pin_clearance_mm: 0.20,
-  mold_with_pins: true,
   mold_sprue_radius_mm: 3.0,
   mold_vent_radius_mm: 1.0,
   mold_with_sprue: true,
@@ -35,7 +29,6 @@ const defaultConfig: PipelineConfig = {
 type ConnStatus = 'checking' | 'online' | 'offline' | 'no_watcher' | 'launching';
 
 export default function App() {
-  const devMode = new URLSearchParams(window.location.search).has('dev');
   const [config, setConfig] = useState<PipelineConfig>(defaultConfig);
   const [step, setStep] = useState(1);
   const [pipeStatus, setPipeStatus] = useState<PipelineStatus>('idle');
@@ -51,6 +44,7 @@ export default function App() {
   const [validateStatus, setValidateStatus] = useState<ValidateStatus>('idle');
   const [validateResult, setValidateResult] = useState<ValidateResult | null>(null);
   const [validateError, setValidateError] = useState('');
+  const [bolusInfo, setBolusInfo] = useState<BolusInfo | null>(null);
   const [jumpMsg, setJumpMsg] = useState('');
   const [pipelineThickness, setPipelineThickness] = useState<number | null>(() => {
     const v = sessionStorage.getItem('pipelineThickness');
@@ -92,7 +86,6 @@ export default function App() {
   const updateConfig = useCallback((p: Partial<PipelineConfig>) => setConfig((prev) => ({ ...prev, ...p })), []);
 
   const canNext = () => {
-    if (devMode) return true;
     switch (step) {
       case 1: return config.dicom_dir.trim().length > 0 || slicer.volumes.length > 0;
       case 2: return previewStatus === 'done';
@@ -124,7 +117,20 @@ export default function App() {
   const handleNext = () => { if (step === 5 && pipeStatus !== 'completed') { executePipeline(); return; } setStep((s) => Math.min(s + 1, 8)); };
   const addLocalLog = (level: LogEntry['level'], msg: string) => setLocalLogs((p) => [...p, { timestamp: new Date().toLocaleTimeString(), level, message: msg }]);
 
-  const executePipeline = async () => { setPipeStatus('running'); setLocalLogs([]); clearLogs(); addLocalLog('info', 'Starting pipeline...'); try { const r = await fetch('/api/execute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...config, use_existing_volumes: config.dicom_dir === '__slicer__' }) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || 'Failed'); } const d = await r.json(); addLocalLog('success', `Done! ${d.output_files?.join(', ') || ''}`); setPipeStatus('completed'); setPipelineThickness(config.thickness_mm); sessionStorage.setItem('pipelineThickness', String(config.thickness_mm)); } catch (err: any) { addLocalLog('error', err.message); setPipeStatus('error'); } };
+  const executePipeline = async () => {
+    setPipeStatus('running'); setBolusInfo(null); setLocalLogs([]); clearLogs();
+    addLocalLog('info', 'Starting pipeline...');
+    try {
+      const r = await fetch('/api/execute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...config, use_existing_volumes: config.dicom_dir === '__slicer__' }) });
+      if (!r.ok) { const e = await r.json(); throw new Error(e.detail || 'Failed'); }
+      const d = await r.json();
+      const info = d.output_files?.[0];
+      if (info?.bounds_mm && info?.volume_cm3 != null) setBolusInfo(info as BolusInfo);
+      addLocalLog('success', `Done! ${info?.bolus || ''}`);
+      setPipeStatus('completed'); setPipelineThickness(config.thickness_mm);
+      sessionStorage.setItem('pipelineThickness', String(config.thickness_mm));
+    } catch (err: any) { addLocalLog('error', err.message); setPipeStatus('error'); }
+  };
 
   const canJumpToStep = (target: number): string | null => {
     if (target <= 1) return null;
@@ -163,30 +169,30 @@ export default function App() {
   const handlePrev = () => {
     const prev = Math.max(step - 1, 1);
     setStep(prev);
-    if (step === 5) setPipeStatus('idle');
+    if (step === 5) { setPipeStatus('idle'); setBolusInfo(null); }
     if (step === 6) setMoldStatus('idle');
     if (step === 7) setValidateStatus('idle');
   };
 
   const renderStep = () => {
     switch (step) {
-      case 1: return <DicomSelector config={config} onChange={updateConfig} slicer={slicer} />;
+      case 1: return <DicomSelector config={config} onChange={updateConfig} slicer={slicer} onJumpToStep={handleJumpToStep} />;
       case 2: return <SegmentationPanel config={config} onChange={updateConfig} onPreview={handlePreview} onScissors={handleScissors} onSolidify={handleSolidify} onSeal={handleSeal} onFinalize={handleFinalize} previewStatus={previewStatus} previewError={previewError} />;
       case 3: return <RoiSelector config={config} onChange={updateConfig} slicer={slicer} />;
       case 4: return <BolusDesigner config={config} onChange={updateConfig} />;
-      case 5: return <ExecutionPanel config={config} status={pipeStatus} logs={logs} onExecute={executePipeline} slicer={slicer} />;
+      case 5: return <ExecutionPanel config={config} status={pipeStatus} logs={logs} onExecute={executePipeline} slicer={slicer} bolusInfo={bolusInfo} />;
       case 6: return <MoldGenerator config={config} onChange={updateConfig} onGenerate={handleMold} moldStatus={moldStatus} moldError={moldError} />;
       case 7: return <ValidatePanel config={config} onValidate={handleValidate} validateStatus={validateStatus} validateResult={validateResult} validateError={validateError} />;
       case 8: return <ExportPanel config={config} onChange={updateConfig} slicer={slicer} />;
     }
   };
 
-  if (!devMode && conn !== 'online') {
+  if (conn !== 'online') {
     const statusText = conn === 'checking' ? '检测中...' : conn === 'launching' ? '启动中...' : conn === 'no_watcher' ? 'Slicer 已运行但未加载桥接脚本' : 'Slicer 未连接';
     const isSpinning = conn === 'checking' || conn === 'launching';
     const isNoWatcher = conn === 'no_watcher';
     return (<><div className="min-h-screen flex items-center justify-center bg-medical-900 pb-12"><div className="wizard-card w-full max-w-md p-8 text-center"><h1 className="text-2xl font-bold text-accent-200 mb-2">Bolus Designer</h1><p className="text-medical-500 text-sm mb-8">放疗个性化补偿器数字化设计平台</p><div className="mb-6">{isSpinning ? <div className="animate-spin inline-block w-8 h-8 border-2 border-accent-400 border-t-transparent rounded-full" /> : isNoWatcher ? <div className="text-5xl mb-3">⚠️</div> : <div className="text-5xl mb-3">🔬</div>}<p className={`text-sm mt-3 ${isNoWatcher ? 'text-warning font-medium' : 'text-medical-400'}`}>{statusText}</p>{isNoWatcher && <p className="text-xs text-medical-500 mt-2">Slicer 进程已运行，但未通过 --python-script 加载桥接脚本。<br/>点击下方按钮自动修复（关闭并重启 Slicer）。</p>}</div><button onClick={launchSlicer} disabled={conn === 'launching' || conn === 'checking'} className="btn-primary w-full mb-3 text-base">{conn === 'launching' ? '启动中...' : isNoWatcher ? '🔧 自动修复并重启 Slicer' : '🚀 启动 3D Slicer'}</button>{launchLog && <div className="log-stream mt-4 text-left"><pre className="text-xs text-gray-300 whitespace-pre-wrap">{launchLog}</pre></div>}</div></div><SlicerMonitor slicer={slicer} slicerOnline={slicerOnline} logs={logs} pipeStatus={pipeStatus} /></>);
   }
 
-  return (<><WizardLayout currentStep={step} totalSteps={8} onNext={handleNext} onPrev={handlePrev} canNext={canNext()} isLast={step === 8} status={pipeStatus} slicer={slicer} slicerOnline={slicerOnline} onReconnect={launchSlicer} connecting={conn === 'launching'} onJumpToStep={handleJumpToStep} devMode={devMode}>{renderStep()}</WizardLayout>{jumpMsg && <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-warning/90 text-black text-sm px-4 py-2 rounded-lg shadow-lg">{jumpMsg}</div>}<SlicerMonitor slicer={slicer} slicerOnline={slicerOnline} logs={logs} pipeStatus={pipeStatus} /></>);
+  return (<><WizardLayout currentStep={step} totalSteps={8} onNext={handleNext} onPrev={handlePrev} canNext={canNext()} isLast={step === 8} status={pipeStatus} slicer={slicer} slicerOnline={slicerOnline} onReconnect={launchSlicer} connecting={conn === 'launching'} onJumpToStep={handleJumpToStep}>{renderStep()}</WizardLayout>{jumpMsg && <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-warning/90 text-black text-sm px-4 py-2 rounded-lg shadow-lg">{jumpMsg}</div>}<SlicerMonitor slicer={slicer} slicerOnline={slicerOnline} logs={logs} pipeStatus={pipeStatus} /></>);
 }

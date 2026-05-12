@@ -161,6 +161,13 @@ def mold_generate():
     return _dispatch_slicer(config, "mold", f"模具生成: 壳体{config.get('mold_shell_thickness_mm', 4.0)}mm, bolus={t}mm")
 
 
+@app.route('/api/test/box_phantom', methods=['POST'])
+def load_box_phantom():
+    config = request.get_json(force=True) if request.is_json else {}
+    t = config.get("thickness_mm", 5.0)
+    return _dispatch_slicer(config, "load_box_phantom", f"载入长方体测试体模 (20×20×{t}mm)")
+
+
 @app.route('/api/validate', methods=['POST'])
 def validate():
     config = request.get_json(force=True)

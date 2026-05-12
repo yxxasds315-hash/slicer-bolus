@@ -38,11 +38,18 @@
 - **修复**：阴模用 Segment Editor 标记图 COPY+SUBTRACT；阳模用 vtkAppendPolyData
 - **壳厚下限**：CT Z=3mm 间距，最小壳厚 ≥4mm（前端限到 4-10mm）
 
+### 适形度验证（2026-05-12）
+- **Dice/体积比误判根因**：`vtkPolyDataToImageStencil` 对空心壳网格用奇偶射线规则，射线穿外壁再穿内壁 = 偶数交叉 = "外部"，导致 `vF` 全空 → `vCavity = vExpanded`（实为 bolus + 壳料体积）→ 体积比 3.14、Dice 0.48
+- **修复**：用 EDT 距离场直接定义壳料体素（`dist_outside_B ∈ (0, shell_mm]`），绕开空心网格体素化问题；`vCavity = vB`，体积比/Dice → 1.0
+- **mold∩skin 删除**：bolus 贴皮肤界面必然有重叠，该指标永远误报且信息冗余（MHD/HD95 已验证贴合），已移除
+- **新增指标**：最小壳厚（外表面采样点到 bolus 最小距离，≥3mm 才可打印）；硅胶用量（bolus 体积 × 1.1 g/cm³，仅报告）；模具尺寸（超 256mm 给出警告）
+- **指标说明**：每次验证结束输出各指标含义；不通过时给出具体原因和修复建议
+- **去除测试模式**：删除 `?dev` URL 参数及所有关联逻辑（连接检查绕过、步骤自由跳转、DEV MODE 横幅）
+
 ### 前端
 - 三态连接检测：online / no_watcher / offline
 - QuickJump 横幅：检测已完成步骤，一键跳转
 - Vite 中间件 pkill + 重启 Slicer
-- `?dev` 开发预览模式（跳过连接检查 + 自由跳转）
 - SVG 矢量图标替换 emoji
 
 ### 其他
@@ -78,6 +85,12 @@ cd frontend && npx vite --host 0.0.0.0
 ### 功能
 - **`hollow` 方法未验证**：代码存在于 `execute_pipeline`，但从未端到端运行过。UI 上可选，实际效果不明。需在 Slicer 中手动验证后更新 README。
 
+### 模具生成（2026-05-12 深审遗留风险）
+- **Margin 体素化精度损失**：Slicer Margin 效果按体素膨胀，4mm shell 在 3mm CT 体素上只膨胀 1 体素 ≈ 3mm，实际壳厚比设定值少 ~25%。需在 Slicer 中实测后决定是否补偿（如设 5mm 输入换 4mm 实际厚度）。
+- **单片封闭模具无脱模设计**：模具仅一个 sprue 孔，硅胶硬化后取不出 bolus。当前用法假设：① 柔性 TPU 打印后撕开，② 一次性切开。若临床要重复使用，需要加分模面或两瓣式设计。
+- **底板与皮肤段重叠**：`expanded - bolus` 让模具底板深入 skin 体素空间 shell_mm 深度。浇铸场景无影响（mold 离体使用）；若要把 mold 直接戴在患者身上做治疗，底板会和皮肤冲突。需明确临床流程。
+- **方向假设 Z 朝上**：sprue 与 vent 默认沿 Z 轴穿透模具中心。头顶 bolus 正确；侧脸/腹部 bolus 方向错误，sprue 不在重力上方，硅胶会从错误位置溢出。需根据 bolus 法线方向自适应或加用户朝向控制。
+
 ### 工程质量
 - **无自动化测试**：`test_http.py` 无断言，`test_phantom.py` 需手动粘贴到 Slicer Console。无法做回归保护。
 - **`test_http.py` 仅打印不断言**：`test_health()` / `test_status()` 缺少 assert，不能用于 CI。
@@ -90,4 +103,4 @@ cd frontend && npx vite --host 0.0.0.0
 
 - 主分支: main
 - 远程: github.com:yxxasds315-hash/slicer-bolus.git
-- 本地领先 0 commit（已推送）
+- 本地与远程同步（已推送）

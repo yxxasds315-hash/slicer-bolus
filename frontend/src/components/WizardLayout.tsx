@@ -41,7 +41,7 @@ export function StepIndicator({ steps, currentStep, onStepClick }: StepIndicator
   );
 }
 
-interface WizardLayoutProps { children: React.ReactNode; currentStep: number; totalSteps?: number; onNext: () => void; onPrev: () => void; canNext: boolean; isLast: boolean; status: PipelineStatus; slicer?: SlicerState; slicerOnline?: boolean; onReconnect?: () => void; connecting?: boolean; onJumpToStep?: (step: number) => void; devMode?: boolean; }
+interface WizardLayoutProps { children: React.ReactNode; currentStep: number; totalSteps?: number; onNext: () => void; onPrev: () => void; canNext: boolean; isLast: boolean; status: PipelineStatus; slicer?: SlicerState; slicerOnline?: boolean; onReconnect?: () => void; connecting?: boolean; onJumpToStep?: (step: number) => void; }
 
 function detectCompletedSteps(slicer?: SlicerState): Set<number> {
   const done = new Set<number>();
@@ -69,10 +69,11 @@ const steps: StepInfo[] = [
   { id: 4, label: '补偿器设计', Icon: STEP_ICONS[4] },
   { id: 5, label: '执行',       Icon: STEP_ICONS[5] },
   { id: 6, label: '模具设计',   Icon: STEP_ICONS[6] },
-  { id: 7, label: '导出 STL',   Icon: STEP_ICONS[7] },
+  { id: 7, label: '适形度评估', Icon: STEP_ICONS[7] },
+  { id: 8, label: '导出 STL',   Icon: STEP_ICONS[8] },
 ];
 
-export function WizardLayout({ children, currentStep, totalSteps: _ts, onNext, onPrev, canNext, isLast, status, slicer, slicerOnline, onReconnect, connecting, onJumpToStep, devMode }: WizardLayoutProps) {
+export function WizardLayout({ children, currentStep, totalSteps: _ts, onNext, onPrev, canNext, isLast, status, slicer, slicerOnline, onReconnect, connecting, onJumpToStep }: WizardLayoutProps) {
   const totalSteps = _ts || steps.length;
   const CurrentIcon = STEP_ICONS[currentStep] || STEP_ICONS[1];
   return (
@@ -94,12 +95,7 @@ export function WizardLayout({ children, currentStep, totalSteps: _ts, onNext, o
           </button>
         </div>
       )}
-      {devMode && (
-        <div className="w-full max-w-xl mb-2 text-center">
-          <span className="inline-block px-3 py-0.5 bg-warning/20 border border-warning/30 rounded-full text-xs text-warning font-mono">DEV MODE — 自由跳转</span>
-        </div>
-      )}
-      <StepIndicator steps={steps} currentStep={currentStep} onStepClick={(id) => devMode && onJumpToStep?.(id)} status={status} />
+      <StepIndicator steps={steps} currentStep={currentStep} onStepClick={undefined} status={status} />
       <div className="wizard-card w-full max-w-xl p-6">
         <h2 className="text-lg font-semibold text-accent-200 mb-4 flex items-center gap-2.5">
           <CurrentIcon className="w-6 h-6 text-accent-400" />
