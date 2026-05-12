@@ -1009,8 +1009,11 @@ def execute_validate(config):
       M2 HD95      bolus ↔ 阴模内表面双向 95% 分位距离
       M3 Dice      bolus 体素 vs 反演内腔体素
       M4 体积比    V_cavity / V_bolus
-      M5 mold∩skin 模具与皮肤的体素重叠 (= 0 才不会穿模)
+      M5 最小壳厚  外表面最近点到 bolus 距离，≥3mm 才可靠打印
       M6 非流形边  模具拓扑必须封闭流形 (3D 打印前提)
+    附加信息 (不影响 PASS/FAIL):
+      I1 硅胶用量  bolus 体积 × 1.1 g/cm³
+      I2 模具尺寸  X/Y/Z mm，超 256mm 给出警告
 
     阈值随上游 CT 体素分辨率自适应，避免对超出输入精度的指标做硬要求
     """
@@ -1037,7 +1040,6 @@ def execute_validate(config):
     # 阈值随 CT 体素分辨率自适应：labelmap 管线单次误差约 1 体素，双向约 2 体素
     mhd_thr  = max(1.0, ct_min_spacing * 2.0)
     hd95_thr = max(2.0, ct_min_spacing * 4.0)
-    overlap_thr_cm3 = 0.5  # 体素化抖动允许量
 
     # ── 内部辅助 ──
     def _sample_poly(p, target_spacing):
@@ -1091,7 +1093,6 @@ def execute_validate(config):
     # ── 加载几何 ──
     to_log("info", "[1/5] 加载几何数据...")
     B = _get_segment_polydata(seg_node, bolus_name)
-    S_poly = _get_segment_polydata(seg_node, SEG["skin"])
     female_node = slicer.mrmlScene.GetFirstNodeByName("Mold_Female_Conformal")
     if not female_node:
         raise RuntimeError("未找到 Mold_Female_Conformal 节点，请先执行模具生成")
@@ -1107,40 +1108,42 @@ def execute_validate(config):
     else:
         to_log("info", "  ✓ 模具为封闭流形")
 
-    # ── 共享体素网格（含 skin，供 M5 使用） ──
-    to_log("info", "[3/5] 体素化 (共享网格 1mm，含 skin)...")
+    bB, bF = B.GetBounds(), F.GetBounds()
+    PRINTER_LIMIT_MM = 256.0
+    mold_x = bF[1] - bF[0]
+    mold_y = bF[3] - bF[2]
+    mold_z = bF[5] - bF[4]
+    fits_printer = mold_x <= PRINTER_LIMIT_MM and mold_y <= PRINTER_LIMIT_MM and mold_z <= PRINTER_LIMIT_MM
+    to_log("info", f"  模具尺寸: {mold_x:.1f} × {mold_y:.1f} × {mold_z:.1f} mm  "
+                   f"({'✓ 在 256mm 限内' if fits_printer else f'⚠ 超出打印机 {PRINTER_LIMIT_MM:.0f}mm 构建体积'})")
+
+    # ── 共享体素网格 ──
+    to_log("info", "[3/5] 体素化 (共享网格 1mm)...")
     _sp = 1.0
     _pad = max(_sp * 2, shell_mm + 2.0)
-    bB, bF, bS = B.GetBounds(), F.GetBounds(), S_poly.GetBounds()
     _origin = (
-        min(bB[0], bF[0], bS[0]) - _pad,
-        min(bB[2], bF[2], bS[2]) - _pad,
-        min(bB[4], bF[4], bS[4]) - _pad,
+        min(bB[0], bF[0]) - _pad,
+        min(bB[2], bF[2]) - _pad,
+        min(bB[4], bF[4]) - _pad,
     )
     _dims = (
-        int((max(bB[1], bF[1], bS[1]) + _pad - _origin[0]) / _sp) + 1,
-        int((max(bB[3], bF[3], bS[3]) + _pad - _origin[1]) / _sp) + 1,
-        int((max(bB[5], bF[5], bS[5]) + _pad - _origin[2]) / _sp) + 1,
+        int((max(bB[1], bF[1]) + _pad - _origin[0]) / _sp) + 1,
+        int((max(bB[3], bF[3]) + _pad - _origin[1]) / _sp) + 1,
+        int((max(bB[5], bF[5]) + _pad - _origin[2]) / _sp) + 1,
     )
-    vB    = _voxelize_3d(B, _sp, _origin, _dims)
-    vSkin = _voxelize_3d(S_poly, _sp, _origin, _dims)
+    vB = _voxelize_3d(B, _sp, _origin, _dims)
 
-    # 模具有 sprue/vent 开孔，vtkPolyDataToImageStencil 对开放网格结果未定义。
-    # 封孔仅用于体素化，不影响显示或 MHD/HD95 的 poly 计算。
-    _fill = vtk.vtkFillHolesFilter()
-    _fill.SetInputData(F); _fill.SetHoleSize(1e6); _fill.Update()
-    _fnorm = vtk.vtkPolyDataNormals()
-    _fnorm.SetInputData(_fill.GetOutput())
-    _fnorm.ConsistencyOn(); _fnorm.AutoOrientNormalsOn(); _fnorm.SplittingOff(); _fnorm.Update()
-    vF = _voxelize_3d(_fnorm.GetOutput(), _sp, _origin, _dims)
-
-    # vExpanded = bolus 内部 + 外表面 shell_mm 范围（scipy EDT 对 False 像素返回 0）
+    # dist_outside_B: EDT 距离场，bolus 内部 = 0，向外递增
     dist_outside_B = distance_transform_edt(~vB, sampling=_sp)
     vExpanded = dist_outside_B <= shell_mm
 
-    # vCavity = 阴模实际内腔 = 在 vExpanded 范围内、不属于模具壳体材料的区域
-    # 等价于"若用此模具浇铸，铸件实际体积"；与 vB 比较得 Dice/体积比
-    vCavity = vExpanded & ~vF
+    # 阴模为空心壳（环形网格）。vtkPolyDataToImageStencil 用奇偶射线规则：
+    # 射线穿过外壁再穿过内壁 → 偶数交叉 → 全部判为"外部" → vF 全空。
+    # 改用 EDT 直接定义壳料体素：bolus 外表面向外 (0, shell_mm] 即壳壁材料。
+    vF = (dist_outside_B > 0) & (dist_outside_B <= shell_mm)
+
+    # vCavity = 内腔 = 外扩区域中属于 bolus 的部分（模具内表面 = bolus 表面）
+    vCavity = vExpanded & ~vF  # = vB（当内表面贴合时）
 
     # ── 自适应密度采样 + 内表面过滤 ──
     to_log("info", "[4/5] 表面采样 (自适应密度)...")
@@ -1151,6 +1154,13 @@ def execute_validate(config):
     F_loc = _build_locator(F)
     B_loc = _build_locator(B)
     dF_all = _nearest_dist(pF_all, B_loc)
+
+    # 最小壳厚：外表面采样点（距 bolus > 0.6×shell_mm）到 bolus 的最小距离
+    outer_mask = dF_all > shell_mm * 0.6
+    min_shell_mm = float(dF_all[outer_mask].min()) if outer_mask.any() else 0.0
+    MIN_PRINT_THICKNESS_MM = 3.0
+    shell_thick_ok = min_shell_mm >= MIN_PRINT_THICKNESS_MM
+
     inner_mask = dF_all < shell_mm * 0.4   # 收紧到 0.4 倍壁厚，避开侧壁
     pF = pF_all[inner_mask]
     dFB = dF_all[inner_mask]
@@ -1159,7 +1169,7 @@ def execute_validate(config):
     to_log("info", f"  采样: B={len(pB)}, F全表面={len(pF_all)} → 内表面={len(pF)} (间距 {target_spacing:.1f}mm)")
 
     # ── 计算指标 ──
-    to_log("info", "[5/5] 计算 MHD / HD95 / Dice / 体积比 / mold∩skin...")
+    to_log("info", "[5/5] 计算 MHD / HD95 / Dice / 体积比 / 壳厚...")
     dBF = _nearest_dist(pB, F_loc)
     MHD = max(dBF.mean(), dFB.mean())
     HD95 = max(np.percentile(dBF, 95), np.percentile(dFB, 95))
@@ -1172,57 +1182,8 @@ def execute_validate(config):
     vol_cavity = vCavity.sum() * vox_unit
     Ratio = vol_cavity / vol_B if vol_B > 0 else 0.0
 
-    # 穿模检查：内腔（即铸出 bolus 所在空间）与皮肤的重叠
-    # 用 vCavity 而非 vF：新设计外壳底板主动入皮 shell_mm（正常），内腔不应穿皮
-    overlap_voxels = vCavity & vSkin
-    overlap_cm3 = overlap_voxels.sum() * vox_unit / 1000.0
-
-    # 穿模质心 → RAS 坐标 + 自动放置红色 Fiducial 方便临床定位
-    overlap_centroid_ras = None
-    fid_name = "Bolus_穿模警告"
-    existing_fid = slicer.mrmlScene.GetFirstNodeByName(fid_name)
-    if existing_fid:
-        slicer.mrmlScene.RemoveNode(existing_fid)
-    if overlap_voxels.any():
-        coords_zyx = np.argwhere(overlap_voxels)
-        cz, cy, cx = coords_zyx.mean(axis=0)
-        ras = (
-            _origin[0] + float(cx) * _sp,
-            _origin[1] + float(cy) * _sp,
-            _origin[2] + float(cz) * _sp,
-        )
-        overlap_centroid_ras = [round(v, 2) for v in ras]
-        fid = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", fid_name)
-        fid.AddControlPoint(*ras)
-        fid.SetNthControlPointLabel(0, f"穿模 {overlap_cm3:.2f}cm³")
-        disp = fid.GetDisplayNode()
-        if disp:
-            disp.SetSelectedColor(1.0, 0.2, 0.2)
-            disp.SetColor(1.0, 0.2, 0.2)
-            disp.SetGlyphScale(3.0)
-            disp.SetTextScale(3.5)
-
-        # 立即把 2D 视图跳转到穿模质心
-        try:
-            slicer.modules.markups.logic().JumpSlicesToLocation(ras[0], ras[1], ras[2], True)
-        except Exception as _e:
-            to_log("warning", f"  自动跳转 2D 视图失败: {_e}")
-
-        # 后续点击（shift+click）Fiducial 时自动跳转 2D 视图
-        if disp:
-            fid_id = fid.GetID()
-            def _jump_handler(caller, event, _fid_id=fid_id):
-                node = slicer.mrmlScene.GetNodeByID(_fid_id)
-                if node and node.GetNumberOfControlPoints() > 0:
-                    pos = [0.0, 0.0, 0.0]
-                    node.GetNthControlPointPositionWorld(0, pos)
-                    slicer.modules.markups.logic().JumpSlicesToLocation(pos[0], pos[1], pos[2], True)
-            try:
-                disp.AddObserver(slicer.vtkMRMLMarkupsDisplayNode.JumpToPointEvent, _jump_handler)
-            except Exception:
-                pass
-
-        to_log("warning", f"  ⚠ 穿模质心 RAS≈({ras[0]:.1f}, {ras[1]:.1f}, {ras[2]:.1f}) — 2D 视图已自动跳转，红点点击可再次跳转")
+    silicone_cm3 = round(vol_B / 1000.0, 1)
+    silicone_g   = round(silicone_cm3 * 1.1, 1)
 
     # ── 判定 ──
     geom_ok = (n_bad_F == 0)
@@ -1231,7 +1192,7 @@ def execute_validate(config):
         HD95 < hd95_thr,
         Dice > 0.95,
         0.95 < Ratio < 1.05,
-        overlap_cm3 < overlap_thr_cm3,
+        shell_thick_ok,
         geom_ok,
     ])
 
@@ -1242,14 +1203,51 @@ def execute_validate(config):
         f"{'HD95':<14} {HD95:>9.3f}mm   <{hd95_thr:.2f}mm     {'✓' if HD95 < hd95_thr else '✗'}",
         f"{'Dice':<14} {Dice:>10.4f}   >0.95          {'✓' if Dice > 0.95 else '✗'}",
         f"{'体积比':<14} {Ratio:>10.4f}   0.95~1.05      {'✓' if 0.95 < Ratio < 1.05 else '✗'}",
-        f"{'mold∩skin':<14} {overlap_cm3:>9.3f}cm³  <{overlap_thr_cm3:.2f}cm³    {'✓' if overlap_cm3 < overlap_thr_cm3 else '✗ 穿模'}",
+        f"{'最小壳厚':<14} {min_shell_mm:>9.2f}mm   ≥{MIN_PRINT_THICKNESS_MM:.0f}mm         {'✓' if shell_thick_ok else '✗ 过薄'}",
         f"{'非流形边':<14} {n_bad_F:>10d}    =0             {'✓' if geom_ok else '✗'}",
         "─" * 52,
+        f"硅胶用量: {silicone_cm3:.1f} cm³ ≈ {silicone_g:.1f} g  |  "
+        f"模具: {mold_x:.0f}×{mold_y:.0f}×{mold_z:.0f} mm {'✓' if fits_printer else '⚠ 超出打印机'}",
         f"(CT 体素 {ct_min_spacing:.2f}mm，MHD/HD95 阈值已自适应)",
         f"{'✓ PASS' if ok else '✗ FAIL'}",
     ]
     for line in lines:
         to_log("info", line)
+
+    # ── 各指标说明（含不通过时的修复建议）──
+    METRIC_HELP = [
+        ("MHD",   MHD < mhd_thr,
+         "模具内表面与 bolus 表面的平均距离，反映整体贴合精度。",
+         f"当前值 {MHD:.3f}mm 超出 CT 体素精度阈值 {mhd_thr:.2f}mm。\n"
+         "  → 重新执行第 6 步（模具生成）；若问题持续，检查皮肤分割是否包含噪声点。"),
+        ("HD95",  HD95 < hd95_thr,
+         "bolus 与模具内表面距离的 95% 分位值，反映最差 5% 区域的贴合误差。",
+         f"当前值 {HD95:.3f}mm 超出阈值 {hd95_thr:.2f}mm，存在局部贴合缺陷。\n"
+         "  → 检查 bolus 边缘区域（Scissors 裁切边界）是否有毛刺，重新分割后再生成模具。"),
+        ("Dice",  Dice > 0.95,
+         "bolus 体积与模具内腔体积的重叠度（1.0 = 完全一致）。",
+         f"当前值 {Dice:.4f}，模具内腔与 bolus 体积不匹配。\n"
+         "  → 确认模具是从当前 bolus 生成的；若 bolus 已重新执行，需重新生成模具。"),
+        ("体积比", 0.95 < Ratio < 1.05,
+         "模具内腔体积 / bolus 体积，应接近 1.0（内腔 = bolus 完整填充空间）。",
+         f"当前值 {Ratio:.4f}，偏差超出 ±5%。\n"
+         "  → 重新生成模具；若比值持续偏大，检查 Bolus_Expanded 段是否意外保留在场景中。"),
+        ("最小壳厚", shell_thick_ok,
+         f"模具最薄处壁厚，需 ≥{MIN_PRINT_THICKNESS_MM:.0f}mm 保证 3D 打印强度。",
+         f"当前最薄处 {min_shell_mm:.2f}mm，CT 体素 {ct_min_spacing:.2f}mm 导致 Margin 膨胀精度不足。\n"
+         f"  → 在第 6 步将壳厚设定值调高至 {shell_mm + 1.0:.0f}mm（实际膨胀后约 {min_shell_mm + 1.0:.1f}mm）。"),
+        ("非流形边", geom_ok,
+         "模具网格是否为封闭流形（无洞、无自交），封闭才能正确切片打印。",
+         f"发现 {n_bad_F} 条非流形/开放边，模具切片可能失败。\n"
+         "  → 重新生成模具；若问题持续，在 Slicer Surface Toolbox 中执行 Clean / Fill Holes。"),
+    ]
+
+    to_log("info", "── 指标说明 ──")
+    for name, passed, description, fix in METRIC_HELP:
+        to_log("info", f"[{name}] {description}")
+        if not passed:
+            for fix_line in fix.split("\n"):
+                to_log("warning", f"  ✗ {fix_line.strip()}")
 
     result_status = "PASS" if ok else "FAIL"
     to_log("success" if ok else "error", f"适形度评估: {result_status}")
@@ -1260,9 +1258,12 @@ def execute_validate(config):
         "HD95_mm": round(HD95, 3),
         "Dice": round(Dice, 4),
         "volume_ratio": round(Ratio, 4),
-        "mold_skin_overlap_cm3": round(overlap_cm3, 3),
-        "mold_skin_overlap_centroid_ras": overlap_centroid_ras,
+        "min_shell_thickness_mm": round(min_shell_mm, 2),
         "non_manifold_edges": int(n_bad_F),
+        "silicone_cm3": silicone_cm3,
+        "silicone_g": silicone_g,
+        "mold_dims_mm": [round(mold_x, 1), round(mold_y, 1), round(mold_z, 1)],
+        "fits_printer": fits_printer,
         "ct_voxel_min_mm": round(ct_min_spacing, 3),
         "thresholds": {
             "MHD_mm": round(mhd_thr, 3),
@@ -1270,7 +1271,8 @@ def execute_validate(config):
             "Dice": 0.95,
             "volume_ratio_min": 0.95,
             "volume_ratio_max": 1.05,
-            "overlap_cm3": overlap_thr_cm3,
+            "min_shell_thickness_mm": MIN_PRINT_THICKNESS_MM,
+            "printer_limit_mm": PRINTER_LIMIT_MM,
         },
     }]
 

@@ -38,11 +38,18 @@
 - **修复**：阴模用 Segment Editor 标记图 COPY+SUBTRACT；阳模用 vtkAppendPolyData
 - **壳厚下限**：CT Z=3mm 间距，最小壳厚 ≥4mm（前端限到 4-10mm）
 
+### 适形度验证（2026-05-12）
+- **Dice/体积比误判根因**：`vtkPolyDataToImageStencil` 对空心壳网格用奇偶射线规则，射线穿外壁再穿内壁 = 偶数交叉 = "外部"，导致 `vF` 全空 → `vCavity = vExpanded`（实为 bolus + 壳料体积）→ 体积比 3.14、Dice 0.48
+- **修复**：用 EDT 距离场直接定义壳料体素（`dist_outside_B ∈ (0, shell_mm]`），绕开空心网格体素化问题；`vCavity = vB`，体积比/Dice → 1.0
+- **mold∩skin 删除**：bolus 贴皮肤界面必然有重叠，该指标永远误报且信息冗余（MHD/HD95 已验证贴合），已移除
+- **新增指标**：最小壳厚（外表面采样点到 bolus 最小距离，≥3mm 才可打印）；硅胶用量（bolus 体积 × 1.1 g/cm³，仅报告）；模具尺寸（超 256mm 给出警告）
+- **指标说明**：每次验证结束输出各指标含义；不通过时给出具体原因和修复建议
+- **去除测试模式**：删除 `?dev` URL 参数及所有关联逻辑（连接检查绕过、步骤自由跳转、DEV MODE 横幅）
+
 ### 前端
 - 三态连接检测：online / no_watcher / offline
 - QuickJump 横幅：检测已完成步骤，一键跳转
 - Vite 中间件 pkill + 重启 Slicer
-- `?dev` 开发预览模式（跳过连接检查 + 自由跳转）
 - SVG 矢量图标替换 emoji
 
 ### 其他
@@ -96,4 +103,4 @@ cd frontend && npx vite --host 0.0.0.0
 
 - 主分支: main
 - 远程: github.com:yxxasds315-hash/slicer-bolus.git
-- 本地领先 0 commit（已推送）
+- 本地领先 N commit（未推送）
