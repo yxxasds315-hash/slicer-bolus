@@ -45,6 +45,7 @@
 - **新增指标**：最小壳厚（外表面采样点到 bolus 最小距离，≥3mm 才可打印）；硅胶用量（bolus 体积 × 1.1 g/cm³，仅报告）；模具尺寸（超 256mm 给出警告）
 - **指标说明**：每次验证结束输出各指标含义；不通过时给出具体原因和修复建议
 - **去除测试模式**：删除 `?dev` URL 参数及所有关联逻辑（连接检查绕过、步骤自由跳转、DEV MODE 横幅）
+- **删除长方体测试体模**：移除 `execute_load_box_phantom`、`/api/test/box_phantom` 路由、`test_phantom.py` 及前端两处测试按钮
 
 ### 前端
 - 三态连接检测：online / no_watcher / offline
