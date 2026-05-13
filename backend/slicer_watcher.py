@@ -271,18 +271,25 @@ def execute_preview(config):
     to_log("info", "========== 预览: 加载数据 + 皮肤分割 ==========")
 
     to_log("info", "[1/3] 加载数据...")
-    vols = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
     if d.get("dicom_dir") == "__slicer__":
+        vols = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
         if not vols: raise RuntimeError("Slicer 中无体积数据")
+        vol = vols[0]
     else:
+        # 记录加载前已有的 volume ID，加载完成后从"新增"中挑选，避免误选旧病人数据
+        existing_ids = {v.GetID() for v in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")}
         with DICOMUtils.TemporaryDICOMDatabase() as db:
             DICOMUtils.importDicom(d["dicom_dir"], db)
             for puid in db.patients():
                 DICOMUtils.loadPatientByUID(puid)
         slicer.app.processEvents()
-        vols = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
-    if not vols: raise RuntimeError("未找到体积数据")
-    vol = vols[0]
+        new_vols = [v for v in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
+                    if v.GetID() not in existing_ids]
+        if not new_vols:
+            raise RuntimeError("DICOM 加载未产生新体积数据，请检查目录与 DICOM 完整性")
+        vol = new_vols[0]
+        if len(existing_ids) > 0:
+            to_log("info", f"  场景已有 {len(existing_ids)} 个体积，使用新加载的 {vol.GetName()}")
     to_log("info", f"  体积: {vol.GetName()}")
 
     to_log("info", "[2/3] 皮肤分割...")
@@ -451,6 +458,8 @@ def execute_solidify(config):
             eff.setParameter(k, v)
         eff.self().onApply()
 
+    # 在 try 外初始化：若早期 effect 抛错，finally 不会触发 UnboundLocalError 掩盖原始异常
+    air_id = None
     try:
         to_log("info", "[1/4] 形态学闭合 — 密封气道开口...")
         apply_effect("Smoothing", {
@@ -481,7 +490,8 @@ def execute_solidify(config):
         editorWidget.setActiveEffectByName("")
         slicer.mrmlScene.RemoveNode(editorNode)
         editorWidget.setMRMLScene(None)
-        seg.RemoveSegment(air_id)
+        if air_id is not None:
+            seg.RemoveSegment(air_id)
 
     seg_node.CreateClosedSurfaceRepresentation()
     to_log("success", "实心化完成 — 所有内部空腔已填充, 身体为完整实心体")
@@ -680,6 +690,10 @@ def _poly_boolean(poly_a, poly_b, operation):
 
 def _apply_margin_to_segment(seg_node, segment_name, margin_mm, new_name):
     seg = seg_node.GetSegmentation()
+    # 入口防御性清理：上一次失败可能遗留同名段（陈旧几何），先删除再新建避免污染本次结果
+    old_target = seg.GetSegmentIdBySegmentName(new_name)
+    if old_target:
+        seg.RemoveSegment(old_target)
     src_id = seg.GetSegmentIdBySegmentName(segment_name)
     new_id = seg.AddEmptySegment(new_name, new_name)
     ref_volume = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
@@ -841,12 +855,16 @@ def _strip_top_plate(seg_node, bolus_id, female_id, ref_volume, skin_id=None):
 def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm, open_top=False):
     """阴模：bolus 外扩 shell_mm 后掏除 bolus，得到封闭空心壳。
 
-    open_top=True 时进一步移除 bolus 上方的顶板，使内腔从 Z+ 方向敞开，
+    返回 (closed_poly, final_poly, open_top_direction)：
+      - closed_poly：纯封闭壳体（无开口/无 sprue/无底板），供 validate 做精确体素化用
+      - final_poly：在 closed_poly 基础上按 open_top 选项再处理（可能是同一对象）
+      - open_top_direction：若开顶则返回方向标签，否则 None
+
+    open_top=True 时进一步移除 bolus 上方的顶板，使内腔从 outward 方向敞开，
     便于直接灌胶和脱模（不需 sprue/vent）。
 
     不减 skin：bolus 底面天然贴 skin 表面，内腔底面即为 skin 随形面；
     外壳底面深入 skin shell_mm（壳壁厚度），是浇铸模具的正常底板厚度。
-    减 skin 会把底板整个挖穿，marching cubes 补出碎面，不能用。
     """
     to_log("info", f"── 阴模生成（{'顶开式' if open_top else '封闭式'}）──")
     seg = seg_node.GetSegmentation()
@@ -890,29 +908,58 @@ def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm, open_top=False)
         ew.setMRMLScene(None)
         slicer.mrmlScene.RemoveNode(en)
 
+    def _extract_and_normalize():
+        """从 female_name 当前 labelmap 提取 polydata 并修正法线一致性。
+
+        关键：_get_segment_polydata 内部只在 GetClosedSurfaceRepresentation 返回空时
+        才 Create，因此一旦该 segment 已有 closed surface 缓存，labelmap 后续被
+        _strip_top_plate 改写后第二次调用会返回 stale 几何。这里显式移除该 segment
+        的 closed surface 表示，强制 Create 从当前 labelmap 重建。
+        """
+        seg = seg_node.GetSegmentation()
+        cs_name = slicer.vtkSegmentationConverter.GetClosedSurfaceRepresentationName()
+        seg_obj = seg.GetSegment(seg.GetSegmentIdBySegmentName(female_name))
+        if seg_obj:
+            seg_obj.RemoveRepresentation(cs_name)
+        seg_node.CreateClosedSurfaceRepresentation()
+        poly = _get_segment_polydata(seg_node, female_name)
+        n = vtk.vtkPolyDataNormals()
+        n.SetInputData(poly)
+        n.ConsistencyOn()
+        n.SplittingOff()
+        n.Update()
+        return n.GetOutput()
+
+    # 第一次提取：纯封闭壳，validate 用
+    closed_poly = _extract_and_normalize()
+    fe0 = vtk.vtkFeatureEdges()
+    fe0.SetInputData(closed_poly)
+    fe0.BoundaryEdgesOn(); fe0.NonManifoldEdgesOn()
+    fe0.FeatureEdgesOff(); fe0.ManifoldEdgesOff()
+    fe0.Update()
+    n_open_closed = fe0.GetOutput().GetNumberOfCells()
+    to_log("info", f"  [封闭壳] {closed_poly.GetNumberOfPoints():,} pts，开放边: {n_open_closed} "
+                   f"({'封闭' if n_open_closed == 0 else '⚠ 有缺口（不应发生）'})")
+
     open_top_direction = None
     if open_top:
+        # 在 labelmap 空间剥顶后再次提取，闭合壳 polydata 已抓住，不受影响
         skin_id = seg.GetSegmentIdBySegmentName(skin_name) if skin_name else None
         open_top_direction = _strip_top_plate(seg_node, bolus_id, female_id, ref_volume, skin_id=skin_id)
+        final_poly = _extract_and_normalize()
+        fe1 = vtk.vtkFeatureEdges()
+        fe1.SetInputData(final_poly)
+        fe1.BoundaryEdgesOn(); fe1.NonManifoldEdgesOn()
+        fe1.FeatureEdgesOff(); fe1.ManifoldEdgesOff()
+        fe1.Update()
+        n_open_final = fe1.GetOutput().GetNumberOfCells()
+        to_log("info", f"  [开顶版] {final_poly.GetNumberOfPoints():,} pts，开放边: {n_open_final} "
+                       f"(顶部敞开方向 {open_top_direction})")
+    else:
+        # 封闭模式：两份引用同一 polydata，避免复制
+        final_poly = closed_poly
 
-    female_poly = _get_segment_polydata(seg_node, female_name)
-
-    norm = vtk.vtkPolyDataNormals()
-    norm.SetInputData(female_poly)
-    norm.ConsistencyOn()
-    norm.SplittingOff()
-    norm.Update()
-    female_poly = norm.GetOutput()
-
-    fe = vtk.vtkFeatureEdges()
-    fe.SetInputData(female_poly)
-    fe.BoundaryEdgesOn(); fe.NonManifoldEdgesOn()
-    fe.FeatureEdgesOff(); fe.ManifoldEdgesOff()
-    fe.Update()
-    open_edges = fe.GetOutput().GetNumberOfCells()
-    closure_label = "封闭" if open_edges == 0 else ("顶部敞开" if open_top else "⚠ 仍有缺口")
-    to_log("info", f"  [阴模] {female_poly.GetNumberOfPoints():,} pts，开放边: {open_edges} ({closure_label})")
-    return female_poly, open_top_direction
+    return closed_poly, final_poly, open_top_direction
 
 
 
@@ -1108,52 +1155,59 @@ def execute_mold(config):
     vent_r   = d.get("mold_vent_radius_mm", 1.0)
     mold_type = d.get("mold_type", "closed")  # "closed" | "open_top"
 
-    # 清理上一次生成的同名节点，避免重复生成时累积 _1/_2 后缀导致导出错乱
+    # 清理上一次生成的同名节点（含 Mold_Female_Closed 和 Mold_Female_Conformal），
+    # 避免重复生成时累积 _1/_2 后缀导致导出/validate 错乱
     for old in list(slicer.util.getNodesByClass("vtkMRMLModelNode")):
-        if old.GetName().startswith("Mold_Female_Conformal"):
+        if old.GetName().startswith("Mold_Female"):
             slicer.mrmlScene.RemoveNode(old)
 
-    female, open_top_direction = _make_female_mold(
-        seg_node, bolus_name, SEG["skin"], shell_mm,
-        open_top=(mold_type == "open_top"),
-    )
+    try:
+        closed, female, open_top_direction = _make_female_mold(
+            seg_node, bolus_name, SEG["skin"], shell_mm,
+            open_top=(mold_type == "open_top"),
+        )
 
-    if mold_type == "open_top":
-        vent_ok = None
-        to_log("info", f"  顶开模具：内腔沿 {open_top_direction} 方向敞开，"
-                       "直接灌胶+脱模，无需注料口/排气孔")
-    elif d.get("mold_with_sprue", True):
-        female, vent_ok = _add_sprue_and_vents(female, sprue_r, vent_r, shell_mm, BOLUS_THICKNESS)
-        if not vent_ok:
-            to_log("warning", "  ⚠ 排气孔未完整生成，灌胶时可能有气泡残留，建议重新生成")
-        to_log("info", f"  注料口: r={sprue_r}mm / 排气孔: r={vent_r}mm ×2")
-    else:
-        vent_ok = None
-        to_log("info", "  跳过注料口 & 排气孔")
+        # 纯封闭壳作为 validate 的体素化基准（隐藏，避免干扰用户视图）
+        closed_node = _add_model_to_scene(closed, "Mold_Female_Closed", color=(0.5, 0.5, 0.5), opacity=0.0)
+        if closed_node and closed_node.GetDisplayNode():
+            closed_node.GetDisplayNode().SetVisibility(False)
 
-    if d.get("mold_base_plate", False):
-        bolus_id = seg.GetSegmentIdBySegmentName(bolus_name)
-        ref_volume = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
-        female = _add_base_plate(female, bolus_id, seg_node, ref_volume)
+        if mold_type == "open_top":
+            vent_ok = None
+            to_log("info", f"  顶开模具：内腔沿 {open_top_direction} 方向敞开，"
+                           "直接灌胶+脱模，无需注料口/排气孔")
+        elif d.get("mold_with_sprue", True):
+            female, vent_ok = _add_sprue_and_vents(female, sprue_r, vent_r, shell_mm, BOLUS_THICKNESS)
+            if not vent_ok:
+                to_log("warning", "  ⚠ 排气孔未完整生成，灌胶时可能有气泡残留，建议重新生成")
+            to_log("info", f"  注料口: r={sprue_r}mm / 排气孔: r={vent_r}mm ×2")
+        else:
+            vent_ok = None
+            to_log("info", "  跳过注料口 & 排气孔")
 
-    _add_model_to_scene(female, "Mold_Female_Conformal", color=(0.87, 0.49, 0.33), opacity=0.75)
+        if d.get("mold_base_plate", False):
+            bolus_id = seg.GetSegmentIdBySegmentName(bolus_name)
+            ref_volume = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
+            female = _add_base_plate(female, bolus_id, seg_node, ref_volume)
 
-    # 清理临时 segment
-    for name in [SEG["temp_bolus_expanded"], "Mold_Female"]:
-        tmp_id = seg.GetSegmentIdBySegmentName(name)
-        if tmp_id:
-            seg.RemoveSegment(tmp_id)
+        _add_model_to_scene(female, "Mold_Female_Conformal", color=(0.87, 0.49, 0.33), opacity=0.75)
 
-    to_log("success", f"模具生成完成 — Mold_Female_Conformal（{'顶开式' if mold_type == 'open_top' else '封闭式'}，橙色）")
+        to_log("success", f"模具生成完成 — Mold_Female_Conformal（{'顶开式' if mold_type == 'open_top' else '封闭式'}，橙色）")
 
-    return [{
-        "node": "Mold_Female_Conformal",
-        "type": "female",
-        "subtype": mold_type,
-        "open_top_direction": open_top_direction,
-        "vertices": female.GetNumberOfPoints(),
-        "vent_ok": vent_ok,
-    }]
+        return [{
+            "node": "Mold_Female_Conformal",
+            "type": "female",
+            "subtype": mold_type,
+            "open_top_direction": open_top_direction,
+            "vertices": female.GetNumberOfPoints(),
+            "vent_ok": vent_ok,
+        }]
+    finally:
+        # 无论成功/失败都清理临时 segment，避免污染下次生成（旧 Bolus_Expanded 被错误复用）
+        for name in [SEG["temp_bolus_expanded"], "Mold_Female"]:
+            tmp_id = seg.GetSegmentIdBySegmentName(name)
+            if tmp_id:
+                seg.RemoveSegment(tmp_id)
 
 
 def execute_validate(config):
@@ -1237,6 +1291,34 @@ def execute_validate(config):
         flat = vtk_to_numpy(st.GetOutput().GetPointData().GetScalars()).astype(bool)
         return ~flat.reshape((dims[2], dims[1], dims[0]))  # SetBackgroundValue(1) → outside=1, invert to get True=inside
 
+    def _vox_enclosed(poly, sp, origin, dims):
+        """vtkSelectEnclosedPoints 体素化（fallback）：对复杂拓扑/翻面网格比 PolyDataToImageStencil 更稳健。
+        返回 (z, y, x) 布尔数组：True = 体素中心位于 poly 围闭区域内（奇偶规则）。"""
+        from vtk.util.numpy_support import numpy_to_vtk
+        nx, ny, nz = dims
+        kk, jj, ii = np.meshgrid(
+            np.arange(nz, dtype=np.float32),
+            np.arange(ny, dtype=np.float32),
+            np.arange(nx, dtype=np.float32),
+            indexing='ij',
+        )
+        pts = np.column_stack([
+            origin[0] + ii.ravel() * sp,
+            origin[1] + jj.ravel() * sp,
+            origin[2] + kk.ravel() * sp,
+        ])
+        vpts = vtk.vtkPoints()
+        vpts.SetData(numpy_to_vtk(pts, deep=1))
+        pd = vtk.vtkPolyData()
+        pd.SetPoints(vpts)
+        sel = vtk.vtkSelectEnclosedPoints()
+        sel.SetInputData(pd)
+        sel.SetSurfaceData(poly)
+        sel.SetTolerance(1e-6)
+        sel.Update()
+        arr = sel.GetOutput().GetPointData().GetArray("SelectedPoints")
+        return vtk_to_numpy(arr).astype(bool).reshape((nz, ny, nx))
+
     def _bad_edges(p):
         fe = vtk.vtkFeatureEdges()
         fe.SetInputData(p)
@@ -1254,14 +1336,29 @@ def execute_validate(config):
     F = female_node.GetPolyData()
     if not F or F.GetNumberOfPoints() == 0:
         raise RuntimeError("Mold_Female_Conformal 无几何数据")
+    # Mold_Female_Closed：制造改造前的纯封闭壳，用于精确体素化和真"几何健康"判定
+    closed_node = slicer.mrmlScene.GetFirstNodeByName("Mold_Female_Closed")
+    closed_poly = closed_node.GetPolyData() if closed_node else None
+    has_closed = bool(closed_poly and closed_poly.GetNumberOfPoints() > 0)
 
     # ── 几何健康检查 ──
     to_log("info", "[2/5] 模具拓扑检查...")
     n_bad_F = _bad_edges(F)
-    if n_bad_F > 0:
-        to_log("warning", f"  ⚠ 模具发现 {n_bad_F} 条非流形/开放边 (3D 打印可能失败)")
+    if has_closed:
+        # 用封闭壳判定真"非流形/开放边"：设计中的 sprue/vent/开顶切口会让 Conformal 必然有开放边
+        n_bad_closed = _bad_edges(closed_poly)
+        if n_bad_closed > 0:
+            to_log("warning", f"  ⚠ 封闭壳发现 {n_bad_closed} 条非流形/开放边（应为 0，几何生成异常）")
+        else:
+            to_log("info", "  ✓ 封闭壳为封闭流形")
+        to_log("info", f"  Conformal 开放边: {n_bad_F}（开顶/sprue/vent 的设计开口属正常）")
     else:
-        to_log("info", "  ✓ 模具为封闭流形")
+        # 旧场景无 Closed 节点：只能拿 Conformal 凑合判，对 open_top/sprue 模具会误报
+        n_bad_closed = n_bad_F
+        if n_bad_F > 0:
+            to_log("warning", f"  ⚠ 模具发现 {n_bad_F} 条非流形/开放边（无 Closed 参照，开顶模具可能误报）")
+        else:
+            to_log("info", "  ✓ 模具为封闭流形")
 
     bB, bF = B.GetBounds(), F.GetBounds()
     PRINTER_LIMIT_MM = 256.0
@@ -1288,17 +1385,45 @@ def execute_validate(config):
     )
     vB = _voxelize_3d(B, _sp, _origin, _dims)
 
-    # dist_outside_B: EDT 距离场，bolus 内部 = 0，向外递增
+    # ── 从纯封闭壳 Mold_Female_Closed 体素化壳料 ──
+    # 体素化必须用封闭网格才能精确（vtkPolyDataToImageStencil 扫描线依赖闭合内外判定）。
+    # execute_mold 已保存制造改造前的封闭版本到 Mold_Female_Closed；此处优先取它。
+    # 若节点不存在（旧场景未重新生成模具），回退到对 F 做 FillHoles 虚拟封闭。
+    closed_node = slicer.mrmlScene.GetFirstNodeByName("Mold_Female_Closed")
+    if closed_node and closed_node.GetPolyData() and closed_node.GetPolyData().GetNumberOfPoints() > 0:
+        F_for_voxel = closed_node.GetPolyData()
+        to_log("info", "  体素化基准: Mold_Female_Closed（开口/sprue/底板之前的封闭壳）")
+    else:
+        to_log("warning", "  ⚠ 未找到 Mold_Female_Closed（场景较旧），用 vtkFillHolesFilter 兜底封闭 F")
+        _fill = vtk.vtkFillHolesFilter()
+        _fill.SetInputData(F)
+        _fill.SetHoleSize(1e6)
+        _fill.Update()
+        _tri = vtk.vtkTriangleFilter()
+        _tri.SetInputData(_fill.GetOutput())
+        _tri.Update()
+        _norm = vtk.vtkPolyDataNormals()
+        _norm.SetInputData(_tri.GetOutput())
+        _norm.ConsistencyOn()
+        _norm.SplittingOff()
+        _norm.Update()
+        F_for_voxel = _norm.GetOutput()
+
+    vF = _voxelize_3d(F_for_voxel, _sp, _origin, _dims)
+    if not vF.any():
+        # 罕见：PolyDataToImageStencil 对此网格失败（如严重翻面/退化三角面），回退更稳健的方法
+        to_log("warning", "  ⚠ PolyDataToImageStencil 体素化全空，回退 vtkSelectEnclosedPoints")
+        vF = _vox_enclosed(F_for_voxel, _sp, _origin, _dims)
+    to_log("info", f"  实际模具壳料: {vF.sum() * _sp**3:.0f} mm³")
+
+    # 理论外包络（仅用于定义"应该是模具占据的区域"参照系）
     dist_outside_B = distance_transform_edt(~vB, sampling=_sp)
     vExpanded = dist_outside_B <= shell_mm
 
-    # 阴模为空心壳（环形网格）。vtkPolyDataToImageStencil 用奇偶射线规则：
-    # 射线穿过外壁再穿过内壁 → 偶数交叉 → 全部判为"外部" → vF 全空。
-    # 改用 EDT 直接定义壳料体素：bolus 外表面向外 (0, shell_mm] 即壳壁材料。
-    vF = (dist_outside_B > 0) & (dist_outside_B <= shell_mm)
-
-    # vCavity = 内腔 = 外扩区域中属于 bolus 的部分（模具内表面 = bolus 表面）
-    vCavity = vExpanded & ~vF  # = vB（当内表面贴合时）
+    # vCavity = 理论外包络中减去实际壳料：
+    # · 模具几何良好 → vF ≈ 预期壳料 → vCavity ≈ vB → Dice ≈ 1
+    # · 模具腔体偏离 bolus（缺料/穿料/位移） → vF 与预期错位 → vCavity 与 vB Dice < 1
+    vCavity = vExpanded & ~vF
 
     # ── 自适应密度采样 + 内表面过滤 ──
     to_log("info", "[4/5] 表面采样 (自适应密度)...")
@@ -1341,7 +1466,8 @@ def execute_validate(config):
     silicone_g   = round(silicone_cm3 * 1.1, 1)
 
     # ── 判定 ──
-    geom_ok = (n_bad_F == 0)
+    # geom_ok 用封闭壳的非流形/开放边数：Conformal 上的 sprue/vent/开顶切口是设计意图，不应判 FAIL
+    geom_ok = (n_bad_closed == 0)
     ok = all([
         MHD < mhd_thr,
         HD95 < hd95_thr,
@@ -1359,7 +1485,7 @@ def execute_validate(config):
         f"{'Dice':<14} {Dice:>10.4f}   >0.95          {'✓' if Dice > 0.95 else '✗'}",
         f"{'体积比':<14} {Ratio:>10.4f}   0.95~1.05      {'✓' if 0.95 < Ratio < 1.05 else '✗'}",
         f"{'最小壳厚':<14} {min_shell_mm:>9.2f}mm   ≥{MIN_PRINT_THICKNESS_MM:.0f}mm         {'✓' if shell_thick_ok else '✗ 过薄'}",
-        f"{'非流形边':<14} {n_bad_F:>10d}    =0             {'✓' if geom_ok else '✗'}",
+        f"{'非流形边':<14} {n_bad_closed:>10d}    =0             {'✓' if geom_ok else '✗'}",
         "─" * 52,
         f"硅胶用量: {silicone_cm3:.1f} cm³ ≈ {silicone_g:.1f} g  |  "
         f"模具: {mold_x:.0f}×{mold_y:.0f}×{mold_z:.0f} mm {'✓' if fits_printer else '⚠ 超出打印机'}",
@@ -1392,8 +1518,8 @@ def execute_validate(config):
          f"当前最薄处 {min_shell_mm:.2f}mm，CT 体素 {ct_max_spacing:.2f}mm 导致 Margin 膨胀精度不足。\n"
          f"  → 在第 6 步将壳厚设定值调高至 {shell_mm + 1.0:.0f}mm（实际膨胀后约 {min_shell_mm + 1.0:.1f}mm）。"),
         ("非流形边", geom_ok,
-         "模具网格是否为封闭流形（无洞、无自交），封闭才能正确切片打印。",
-         f"发现 {n_bad_F} 条非流形/开放边，模具切片可能失败。\n"
+         "封闭壳网格是否为封闭流形（设计中的 sprue/vent/开顶切口已用 Closed 排除）。",
+         f"封闭壳发现 {n_bad_closed} 条非流形/开放边，几何生成阶段已出现破坏。\n"
          "  → 重新生成模具；若问题持续，在 Slicer Surface Toolbox 中执行 Clean / Fill Holes。"),
     ]
 
@@ -1414,7 +1540,7 @@ def execute_validate(config):
         "Dice": round(Dice, 4),
         "volume_ratio": round(Ratio, 4),
         "min_shell_thickness_mm": round(min_shell_mm, 2),
-        "non_manifold_edges": int(n_bad_F),
+        "non_manifold_edges": int(n_bad_closed),
         "silicone_cm3": silicone_cm3,
         "silicone_g": silicone_g,
         "mold_dims_mm": [round(mold_x, 1), round(mold_y, 1), round(mold_z, 1)],
@@ -1477,12 +1603,14 @@ def tick():
         mtime = 0
 
     if mtime > last_config_mtime:
-        last_config_mtime = mtime
+        # 仅在 JSON 成功解析后才更新 last_config_mtime；若读到 Flask 未写完的文件
+        # （json.JSONDecodeError 或 OSError），保留旧 mtime 让下次 tick 重试，避免丢请求
         try:
             with open(CONFIG_FILE) as f:
                 cfg = json.load(f)
-        except:
+        except (OSError, json.JSONDecodeError):
             return
+        last_config_mtime = mtime
 
         req_id = cfg.get("request_id")
         if req_id and req_id != processed_request:

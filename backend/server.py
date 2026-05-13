@@ -53,8 +53,11 @@ def _read_json(path):
 
 
 def _write_json(path, data):
-    with open(path, "w") as f:
+    # 原子写入：先写临时文件再 rename，避免 watcher 读到半写状态导致请求丢失
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
         json.dump(data, f)
+    os.replace(tmp, path)
 
 
 @app.route('/api/health')
