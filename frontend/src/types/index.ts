@@ -14,6 +14,7 @@ export interface PipelineConfig {
   mold_vent_radius_mm: number;
   mold_with_sprue: boolean;
   mold_type: 'closed' | 'open_top';
+  mold_base_plate: boolean;
 }
 
 export interface BolusInfo {

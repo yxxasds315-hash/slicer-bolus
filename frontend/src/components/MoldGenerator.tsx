@@ -8,9 +8,11 @@ interface MoldGeneratorProps {
   moldError: string;
   ventWarning?: boolean;
   openTopDirection?: string | null;
+  moldHasBasePlate?: boolean;
+  onRemoveBasePlate?: () => void;
 }
 
-export function MoldGenerator({ config, onChange, onGenerate, moldStatus, moldError, ventWarning, openTopDirection }: MoldGeneratorProps) {
+export function MoldGenerator({ config, onChange, onGenerate, moldStatus, moldError, ventWarning, openTopDirection, moldHasBasePlate, onRemoveBasePlate }: MoldGeneratorProps) {
   return (
     <div className="space-y-5">
       <p className="text-medical-500 text-sm">
@@ -77,6 +79,21 @@ export function MoldGenerator({ config, onChange, onGenerate, moldStatus, moldEr
             )}
           </div>
         )}
+
+        <div className="border-t border-medical-700 pt-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <h4 className="text-xs font-medium text-medical-400">底板（1mm）</h4>
+              <p className="text-xs text-medical-500 mt-0.5">在模具底部围绕最小投影添加 1mm 平板，增强放置稳定性</p>
+            </div>
+            <button
+              onClick={() => onChange({ mold_base_plate: !config.mold_base_plate })}
+              className={`relative w-10 h-5 rounded-full transition-colors ${config.mold_base_plate ? 'bg-accent-400' : 'bg-medical-600'}`}
+            >
+              <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${config.mold_base_plate ? 'left-5' : 'left-0.5'}`} />
+            </button>
+          </div>
+        </div>
       </div>
 
       {moldStatus === 'idle' && (
@@ -108,6 +125,9 @@ export function MoldGenerator({ config, onChange, onGenerate, moldStatus, moldEr
             </div>
           )}
           <button onClick={onGenerate} className="w-full py-2 px-4 bg-medical-600 text-medical-300 rounded-lg text-sm hover:bg-medical-500 transition-colors">🔄 重新生成</button>
+          {moldHasBasePlate && onRemoveBasePlate && (
+            <button onClick={onRemoveBasePlate} className="w-full py-2 px-4 bg-medical-700 text-medical-400 rounded-lg text-xs hover:bg-medical-600 transition-colors">撤销底板</button>
+          )}
         </div>
       )}
 

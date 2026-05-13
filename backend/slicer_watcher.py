@@ -1018,6 +1018,72 @@ def _add_sprue_and_vents(female_poly, sprue_radius_mm, vent_radius_mm, shell_mm,
     return result, vent_ok
 
 
+def _add_base_plate(female_poly, bolus_id, seg_node, ref_volume, plate_mm=1.0):
+    """在阴模底部（anti-outward方向）添加 plate_mm 厚平板，围绕 bolus 最小投影范围。
+
+    outward 方向检测逻辑与 _strip_top_plate 保持一致（最小维度 = 厚度方向 = outward 轴）。
+    底板在 anti-outward 端，与顶开式开口和 sprue/vent 均处于对侧，不产生冲突。
+    """
+    import numpy as np
+
+    bolus_arr = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, bolus_id, ref_volume).astype(bool)
+    if not bolus_arr.any():
+        to_log("warning", "  ⚠ [底板] bolus labelmap 为空，跳过底板")
+        return female_poly
+
+    sx, sy, sz = ref_volume.GetSpacing()
+    spacing_zyx = np.array([sz, sy, sx])
+    axis_labels = ["Z", "Y", "X"]
+
+    bolus_coords = np.argwhere(bolus_arr)
+    extents_mm = np.array([
+        (bolus_coords[:, ax].max() - bolus_coords[:, ax].min() + 1) * spacing_zyx[ax]
+        for ax in range(3)
+    ])
+    outward_axis = int(np.argmin(extents_mm))  # numpy 轴序 z=0, y=1, x=2
+
+    b_along = float(bolus_coords[:, outward_axis].mean())
+    outward_sign = +1
+    skin_id = seg_node.GetSegmentation().GetSegmentIdBySegmentName(SEG["skin"])
+    if skin_id:
+        skin_arr = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, skin_id, ref_volume).astype(bool)
+        if skin_arr.any():
+            s_along = float(np.argwhere(skin_arr)[:, outward_axis].mean())
+            outward_sign = +1 if b_along > s_along else -1
+
+    # vtk bounds [xmin,xmax,ymin,ymax,zmin,zmax]; numpy z=0→vtk(4,5); y=1→(2,3); x=2→(0,1)
+    _vtk_lo = {0: 4, 1: 2, 2: 0}
+    _vtk_hi = {0: 5, 1: 3, 2: 1}
+    b = female_poly.GetBounds()
+    lo = b[_vtk_lo[outward_axis]]
+    hi = b[_vtk_hi[outward_axis]]
+
+    # 与模具底面重叠 0.5mm：避免 VTK 布尔在零体积接触面（共面无交集）失败或产生非流形边
+    overlap_mm = 0.5
+    if outward_sign > 0:
+        plate_near, plate_far = lo - plate_mm, lo + overlap_mm
+    else:
+        plate_near, plate_far = hi - overlap_mm, hi + plate_mm
+
+    cube = vtk.vtkCubeSource()
+    if outward_axis == 0:    # Z
+        cube.SetBounds(b[0], b[1], b[2], b[3], plate_near, plate_far)
+    elif outward_axis == 1:  # Y
+        cube.SetBounds(b[0], b[1], plate_near, plate_far, b[4], b[5])
+    else:                    # X
+        cube.SetBounds(plate_near, plate_far, b[2], b[3], b[4], b[5])
+    cube.Update()
+
+    result = _poly_boolean(female_poly, cube.GetOutput(), "union")
+    if result.GetNumberOfPoints() == 0:
+        to_log("warning", "  ⚠ [底板] union 失败，保留原模具")
+        return female_poly
+
+    dir_label = f"{'+' if outward_sign > 0 else '-'}{axis_labels[outward_axis]}"
+    to_log("info", f"  [底板] {plate_mm}mm 底板已合并于 {dir_label} 轴底端")
+    return result
+
+
 def execute_mold(config):
     import slicer
     d = config
@@ -1064,6 +1130,11 @@ def execute_mold(config):
     else:
         vent_ok = None
         to_log("info", "  跳过注料口 & 排气孔")
+
+    if d.get("mold_base_plate", False):
+        bolus_id = seg.GetSegmentIdBySegmentName(bolus_name)
+        ref_volume = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
+        female = _add_base_plate(female, bolus_id, seg_node, ref_volume)
 
     _add_model_to_scene(female, "Mold_Female_Conformal", color=(0.87, 0.49, 0.33), opacity=0.75)
 
