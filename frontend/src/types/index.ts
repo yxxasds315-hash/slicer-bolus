@@ -13,6 +13,7 @@ export interface PipelineConfig {
   mold_sprue_radius_mm: number;
   mold_vent_radius_mm: number;
   mold_with_sprue: boolean;
+  mold_type: 'closed' | 'open_top';
 }
 
 export interface BolusInfo {
@@ -23,6 +24,15 @@ export interface BolusInfo {
 }
 
 export type MoldStatus = 'idle' | 'running' | 'completed' | 'error';
+
+export interface MoldResult {
+  node: string;
+  type: string;
+  subtype: 'closed' | 'open_top';
+  open_top_direction: string | null;
+  vertices: number;
+  vent_ok: boolean | null;
+}
 export type ValidateStatus = 'idle' | 'running' | 'completed' | 'error';
 
 export interface ValidateThresholds {
@@ -43,7 +53,7 @@ export interface ValidateResult {
   mold_skin_overlap_cm3: number;
   mold_skin_overlap_centroid_ras: [number, number, number] | null;
   non_manifold_edges: number;
-  ct_voxel_min_mm: number;
+  ct_voxel_max_mm: number;
   thresholds: ValidateThresholds;
 }
 

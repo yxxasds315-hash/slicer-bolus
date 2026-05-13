@@ -128,7 +128,7 @@ export function ValidatePanel({ config, onValidate, validateStatus, validateResu
           </div>
 
           <p className="text-xs text-medical-500 px-1">
-            CT 最小体素 <span className="font-mono text-medical-400">{validateResult.ct_voxel_min_mm.toFixed(2)} mm</span>
+            CT 最大体素 <span className="font-mono text-medical-400">{validateResult.ct_voxel_max_mm.toFixed(2)} mm</span>
             ，MHD/HD95 阈值已据此自适应
           </p>
 

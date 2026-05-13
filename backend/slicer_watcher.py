@@ -751,14 +751,104 @@ def _add_model_to_scene(poly, name, color=(0.8, 0.5, 0.3), opacity=0.7):
     return node
 
 
-def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm):
+def _strip_top_plate(seg_node, bolus_id, female_id, ref_volume, skin_id=None):
+    """在 labelmap 空间沿 bolus outward 方向移除模具顶板，生成顶开式模具。
+
+    Outward 方向自动检测：
+      - 轴：bolus 最小 bbox 维度（薄壳几何下 = 厚度方向 = outward 方向）
+      - 符号：bolus 质心 vs skin 质心沿此轴的位置，bolus 偏哪边即外向哪边
+
+    检测结果：
+      - 头顶 bolus → +Z（Z 是最小维度，bolus 在 skin 上方）
+      - 胸壁 bolus → +Y（Y 是最小维度，bolus 在 skin 前方）
+      - 侧脸 bolus → ±X
+      - 斜面 → 最强分量轴
+
+    对每个垂直 outward 轴的 (a, b) 列，找到 bolus 沿 outward 轴的极值，
+    移除模具中超出此极值的体素。bolus 范围外的列不动，保留侧壁完整。
+
+    返回方向标签（如 "+Y"）供日志和前端展示。
+    """
+    import numpy as np
+    bolus_arr = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, bolus_id, ref_volume).astype(bool)
+    mold_arr  = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, female_id, ref_volume).astype(bool)
+
+    if not bolus_arr.any():
+        to_log("warning", "  ⚠ bolus labelmap 为空，跳过开顶")
+        return None
+
+    # GetSpacing 返回 (sx, sy, sz)；numpy axis 顺序为 (z, y, x)
+    sx, sy, sz = ref_volume.GetSpacing()
+    spacing_zyx = np.array([sz, sy, sx])
+    axis_labels = ["Z", "Y", "X"]
+
+    # ── 自动检测 outward 方向 ──
+    bolus_coords = np.argwhere(bolus_arr)   # (N, 3) 列序 z, y, x
+    extents_mm = np.array([
+        (bolus_coords[:, ax].max() - bolus_coords[:, ax].min() + 1) * spacing_zyx[ax]
+        for ax in range(3)
+    ])
+    outward_axis = int(np.argmin(extents_mm))   # 最小维度 = 厚度方向 = outward 轴
+
+    # 符号：bolus 质心相对 skin 质心沿此轴的位置
+    b_along = float(bolus_coords[:, outward_axis].mean())
+    s_along = None
+    if skin_id:
+        skin_arr = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, skin_id, ref_volume).astype(bool)
+        if skin_arr.any():
+            s_along = float(np.argwhere(skin_arr)[:, outward_axis].mean())
+    if s_along is None:
+        to_log("warning", "  ⚠ skin 段不可用，outward 符号默认取 +")
+        outward_sign = +1
+    else:
+        outward_sign = +1 if b_along > s_along else -1
+
+    dir_label = f"{'+' if outward_sign > 0 else '-'}{axis_labels[outward_axis]}"
+    to_log("info",
+           f"  [开顶] 自动检测 outward 方向: {dir_label} "
+           f"(厚度 {extents_mm[outward_axis]:.1f}mm；其余维度 "
+           f"{', '.join(f'{axis_labels[a]}={extents_mm[a]:.0f}mm' for a in range(3) if a != outward_axis)})")
+
+    # ── 沿 outward 轴扫顶 ──
+    shape = bolus_arr.shape
+    idx_range = np.arange(shape[outward_axis], dtype=np.int32)
+    idx_shape = [1, 1, 1]
+    idx_shape[outward_axis] = shape[outward_axis]
+    idx_grid = idx_range.reshape(idx_shape)
+
+    if outward_sign > 0:
+        # outward 朝 +：找 bolus 在此轴上的最大索引，移除其外侧
+        bolus_extreme = np.where(bolus_arr, idx_grid, -1).max(axis=outward_axis, keepdims=True)
+        to_remove = idx_grid > bolus_extreme
+    else:
+        # outward 朝 -：找最小索引，移除其外侧
+        sentinel = shape[outward_axis]
+        bolus_extreme = np.where(bolus_arr, idx_grid, sentinel).min(axis=outward_axis, keepdims=True)
+        to_remove = idx_grid < bolus_extreme
+
+    has_bolus = bolus_arr.any(axis=outward_axis, keepdims=True)
+    to_remove = to_remove & has_bolus
+
+    mold_open = mold_arr & ~to_remove
+    removed = int((mold_arr & ~mold_open).sum())
+    slicer.util.updateSegmentBinaryLabelmapFromArray(
+        mold_open.astype(np.uint8), seg_node, female_id, ref_volume
+    )
+    to_log("info", f"  [开顶] 沿 {dir_label} 移除顶板 {removed} 体素")
+    return dir_label
+
+
+def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm, open_top=False):
     """阴模：bolus 外扩 shell_mm 后掏除 bolus，得到封闭空心壳。
+
+    open_top=True 时进一步移除 bolus 上方的顶板，使内腔从 Z+ 方向敞开，
+    便于直接灌胶和脱模（不需 sprue/vent）。
 
     不减 skin：bolus 底面天然贴 skin 表面，内腔底面即为 skin 随形面；
     外壳底面深入 skin shell_mm（壳壁厚度），是浇铸模具的正常底板厚度。
     减 skin 会把底板整个挖穿，marching cubes 补出碎面，不能用。
     """
-    to_log("info", "── 阴模生成 ──")
+    to_log("info", f"── 阴模生成（{'顶开式' if open_top else '封闭式'}）──")
     seg = seg_node.GetSegmentation()
 
     _apply_margin_to_segment(seg_node, bolus_name, shell_mm, SEG["temp_bolus_expanded"])
@@ -767,6 +857,9 @@ def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm):
     bolus_id    = seg.GetSegmentIdBySegmentName(bolus_name)
 
     female_name = "Mold_Female"
+    old_female = seg.GetSegmentIdBySegmentName(female_name)
+    if old_female:
+        seg.RemoveSegment(old_female)
     female_id   = seg.AddEmptySegment(female_name, female_name)
     ref_volume  = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
 
@@ -797,6 +890,11 @@ def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm):
         ew.setMRMLScene(None)
         slicer.mrmlScene.RemoveNode(en)
 
+    open_top_direction = None
+    if open_top:
+        skin_id = seg.GetSegmentIdBySegmentName(skin_name) if skin_name else None
+        open_top_direction = _strip_top_plate(seg_node, bolus_id, female_id, ref_volume, skin_id=skin_id)
+
     female_poly = _get_segment_polydata(seg_node, female_name)
 
     norm = vtk.vtkPolyDataNormals()
@@ -812,49 +910,112 @@ def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm):
     fe.FeatureEdgesOff(); fe.ManifoldEdgesOff()
     fe.Update()
     open_edges = fe.GetOutput().GetNumberOfCells()
-    to_log("info", f"  [阴模] {female_poly.GetNumberOfPoints():,} pts，开放边: {open_edges} ({'封闭' if open_edges == 0 else '⚠ 仍有缺口'})")
-    return female_poly
+    closure_label = "封闭" if open_edges == 0 else ("顶部敞开" if open_top else "⚠ 仍有缺口")
+    to_log("info", f"  [阴模] {female_poly.GetNumberOfPoints():,} pts，开放边: {open_edges} ({closure_label})")
+    return female_poly, open_top_direction
 
 
 
-def _add_sprue_and_vents(female_poly, sprue_radius_mm, vent_radius_mm):
+def _add_sprue_and_vents(female_poly, sprue_radius_mm, vent_radius_mm, shell_mm, thickness_mm):
+    """返回 (polydata, vent_ok)。vent_ok=True 表示两个排气孔均打通；False 表示至少一个缺失。
+
+    几何保证：
+      - 圆柱深度 h = shell_mm + thickness_mm/2 + 2：圆柱底落在理论内腔中点
+        cylinder_bottom = z_skin + thickness/2 + (actual_shell - shell_mm)
+        对 Margin 体素化精度误差 |δ| < thickness/2 都能稳健落在内腔内
+        （应对 PROJECT_STATUS 记录的"4mm shell 在 3mm 切片上膨胀成 3mm"欠冲场景，
+        以及反向的过冲场景）。同时距底板 ≥ thickness/2 ≥ 2mm，决不贯穿。
+      - sprue 与 vent 统一以顶面点云重心 (top_cx, top_cy) 为参考，避免对不对称 bolus 用
+        bounding box 中心导致圆柱不落在顶面上。
+      - 落点验证：与最近顶面点距离 > 半径+2mm 则视为落在空洞中（如 U 形 bolus），拒绝处理。
+      - vent 偏移上限 = 内腔半跨度 − vent_radius − 1mm，保证整个孔在 bolus 区域内。
+    """
+    import numpy as np
+    from vtk.util.numpy_support import vtk_to_numpy
+
     to_log("info", "── 注料口 & 排气孔 ──")
     b = female_poly.GetBounds()
-    cx = (b[0] + b[1]) / 2
-    cy = (b[2] + b[3]) / 2
-    cz = (b[4] + b[5]) / 2
-    h_thru = (b[5] - b[4]) + 4
 
-    # 排气孔偏移按模具 X 尺寸自适应，避免小模具上偏移过大错过本体
-    x_span = b[1] - b[0]
-    vent_offset = min(20.0, x_span * 0.35)
-    if vent_offset < sprue_radius_mm + vent_radius_mm + 1.0:
-        to_log("warning", f"  ⚠ 模具 X 跨度 {x_span:.1f}mm 过小，跳过排气孔（仅保留注料口）")
-        skip_vents = True
+    # ── 从顶面点云中选落点 ──
+    pts = vtk_to_numpy(female_poly.GetPoints().GetData())
+    top_mask = pts[:, 2] > b[5] - (shell_mm + 2.0)
+    top_pts = pts[top_mask]
+    if len(top_pts) < 10:
+        to_log("warning", "  ⚠ 顶面点过少，落点回退到全 mesh 中心")
+        top_pts = pts
+
+    top_cx = float(top_pts[:, 0].mean())
+    top_cy = float(top_pts[:, 1].mean())
+    top_x_span = float(top_pts[:, 0].max() - top_pts[:, 0].min())
+    top_y_span = float(top_pts[:, 1].max() - top_pts[:, 1].min())
+
+    # 内腔跨度 ≈ 外顶面跨度 - 2×shell（Margin 向两侧各膨胀 shell_mm）
+    inner_x_span = max(top_x_span - 2.0 * shell_mm, 0.0)
+    inner_y_span = max(top_y_span - 2.0 * shell_mm, 0.0)
+    if inner_x_span >= inner_y_span:
+        long_span, vent_dx, vent_dy, axis_name = inner_x_span, 1, 0, "X"
     else:
-        skip_vents = False
+        long_span, vent_dx, vent_dy, axis_name = inner_y_span, 0, 1, "Y"
 
-    sprue = _make_cylinder_poly(cx, cy, cz, sprue_radius_mm, h_thru)
+    # 圆柱深度：从外顶面上方 2mm 落到理论内腔中点
+    # cylinder_bottom = b[5] + 2 - h = z_skin + thickness/2 + (actual_shell - shell_mm)
+    # 对 |Margin 精度误差| < thickness/2 保持在内腔内；距底板 ≥ thickness/2，绝不贯穿
+    h_cyl = shell_mm + thickness_mm / 2.0 + 2.0
+    cz = b[5] + 2.0 - h_cyl / 2.0
+
+    # ── sprue 落点验证 ──
+    sprue_min_d = float(np.sqrt(
+        (top_pts[:, 0] - top_cx) ** 2 + (top_pts[:, 1] - top_cy) ** 2
+    ).min())
+    if sprue_min_d > sprue_radius_mm + 2.0:
+        raise RuntimeError(
+            f"注料口落点 ({top_cx:.1f}, {top_cy:.1f}) 距最近顶面点 {sprue_min_d:.1f}mm，"
+            "推测 bolus 为 U 形或多分量。请检查皮肤分割与 ROI 设置。"
+        )
+
+    sprue = _make_cylinder_poly(top_cx, top_cy, cz, sprue_radius_mm, h_cyl)
     result = _poly_boolean(female_poly, sprue, "difference")
     if result.GetNumberOfPoints() == 0:
         raise RuntimeError("注料口布尔运算失败（结果为空）")
 
-    if not skip_vents:
-        vent1 = _make_cylinder_poly(cx + vent_offset, cy, cz, vent_radius_mm, h_thru)
-        vent2 = _make_cylinder_poly(cx - vent_offset, cy, cz, vent_radius_mm, h_thru)
-        r1 = _poly_boolean(result, vent1, "difference")
-        if r1.GetNumberOfPoints() == 0:
-            to_log("warning", "  ⚠ 排气孔 1 布尔失败，保留前一步结果")
-        else:
-            result = r1
-        r2 = _poly_boolean(result, vent2, "difference")
-        if r2.GetNumberOfPoints() == 0:
-            to_log("warning", "  ⚠ 排气孔 2 布尔失败，保留前一步结果")
-        else:
-            result = r2
+    # ── 排气孔偏移范围 ──
+    min_offset = sprue_radius_mm + vent_radius_mm + 1.0      # 与 sprue 不重叠
+    max_offset = long_span / 2.0 - vent_radius_mm - 1.0       # 距内腔边 ≥ 1mm
+    vent_offset = min(20.0, long_span * 0.35, max_offset)
 
-    to_log("info", f"  [注料口] r={sprue_radius_mm}mm | [排气孔] r={vent_radius_mm}mm 偏移±{vent_offset:.1f}mm")
-    return result
+    if vent_offset < min_offset:
+        required = (min_offset + vent_radius_mm + 1.0) * 2.0
+        to_log("warning", f"  ⚠ 内腔最长轴 {long_span:.1f}mm 过小（需 ≥{required:.1f}mm），跳过排气孔")
+        skip_vents = True
+    else:
+        skip_vents = False
+
+    vent_ok = not skip_vents
+    if not skip_vents:
+        v_positions = [
+            (top_cx + vent_offset * vent_dx, top_cy + vent_offset * vent_dy, 1),
+            (top_cx - vent_offset * vent_dx, top_cy - vent_offset * vent_dy, 2),
+        ]
+        for vx, vy, idx in v_positions:
+            d_min = float(np.sqrt(
+                (top_pts[:, 0] - vx) ** 2 + (top_pts[:, 1] - vy) ** 2
+            ).min())
+            if d_min > vent_radius_mm + 2.0:
+                to_log("warning", f"  ⚠ 排气孔 {idx} 落点距顶面 {d_min:.1f}mm，超出 bolus 区域，跳过")
+                vent_ok = False
+                continue
+            vent = _make_cylinder_poly(vx, vy, cz, vent_radius_mm, h_cyl)
+            r = _poly_boolean(result, vent, "difference")
+            if r.GetNumberOfPoints() == 0:
+                to_log("warning", f"  ⚠ 排气孔 {idx} 布尔失败，保留前一步结果")
+                vent_ok = False
+            else:
+                result = r
+
+    to_log("info",
+           f"  [注料口] r={sprue_radius_mm}mm h={h_cyl:.1f}mm（圆柱底位于内腔中点）| "
+           f"[排气孔] r={vent_radius_mm}mm 沿内腔{axis_name}轴偏移±{vent_offset:.1f}mm")
+    return result, vent_ok
 
 
 def execute_mold(config):
@@ -879,18 +1040,29 @@ def execute_mold(config):
     shell_mm = d.get("mold_shell_thickness_mm", 4.0)
     sprue_r  = d.get("mold_sprue_radius_mm", 3.0)
     vent_r   = d.get("mold_vent_radius_mm", 1.0)
+    mold_type = d.get("mold_type", "closed")  # "closed" | "open_top"
 
     # 清理上一次生成的同名节点，避免重复生成时累积 _1/_2 后缀导致导出错乱
     for old in list(slicer.util.getNodesByClass("vtkMRMLModelNode")):
         if old.GetName().startswith("Mold_Female_Conformal"):
             slicer.mrmlScene.RemoveNode(old)
 
-    female = _make_female_mold(seg_node, bolus_name, SEG["skin"], shell_mm)
+    female, open_top_direction = _make_female_mold(
+        seg_node, bolus_name, SEG["skin"], shell_mm,
+        open_top=(mold_type == "open_top"),
+    )
 
-    if d.get("mold_with_sprue", True):
-        female = _add_sprue_and_vents(female, sprue_r, vent_r)
+    if mold_type == "open_top":
+        vent_ok = None
+        to_log("info", f"  顶开模具：内腔沿 {open_top_direction} 方向敞开，"
+                       "直接灌胶+脱模，无需注料口/排气孔")
+    elif d.get("mold_with_sprue", True):
+        female, vent_ok = _add_sprue_and_vents(female, sprue_r, vent_r, shell_mm, BOLUS_THICKNESS)
+        if not vent_ok:
+            to_log("warning", "  ⚠ 排气孔未完整生成，灌胶时可能有气泡残留，建议重新生成")
         to_log("info", f"  注料口: r={sprue_r}mm / 排气孔: r={vent_r}mm ×2")
     else:
+        vent_ok = None
         to_log("info", "  跳过注料口 & 排气孔")
 
     _add_model_to_scene(female, "Mold_Female_Conformal", color=(0.87, 0.49, 0.33), opacity=0.75)
@@ -901,9 +1073,16 @@ def execute_mold(config):
         if tmp_id:
             seg.RemoveSegment(tmp_id)
 
-    to_log("success", "模具生成完成 — Mold_Female_Conformal（橙色）")
+    to_log("success", f"模具生成完成 — Mold_Female_Conformal（{'顶开式' if mold_type == 'open_top' else '封闭式'}，橙色）")
 
-    return [{"node": "Mold_Female_Conformal", "type": "female", "vertices": female.GetNumberOfPoints()}]
+    return [{
+        "node": "Mold_Female_Conformal",
+        "type": "female",
+        "subtype": mold_type,
+        "open_top_direction": open_top_direction,
+        "vertices": female.GetNumberOfPoints(),
+        "vent_ok": vent_ok,
+    }]
 
 
 def execute_validate(config):
@@ -940,11 +1119,11 @@ def execute_validate(config):
     vols = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
     if not vols:
         raise RuntimeError("场景中无体积数据，无法读取 CT 体素分辨率")
-    ct_min_spacing = max(min(vols[0].GetSpacing()), 0.1)
+    ct_max_spacing = max(max(vols[0].GetSpacing()), 0.1)
 
     # 阈值随 CT 体素分辨率自适应：labelmap 管线单次误差约 1 体素，双向约 2 体素
-    mhd_thr  = max(1.0, ct_min_spacing * 2.0)
-    hd95_thr = max(2.0, ct_min_spacing * 4.0)
+    mhd_thr  = max(1.0, ct_max_spacing * 2.0)
+    hd95_thr = max(2.0, ct_max_spacing * 4.0)
 
     # ── 内部辅助 ──
     def _sample_poly(p, target_spacing):
@@ -1113,7 +1292,7 @@ def execute_validate(config):
         "─" * 52,
         f"硅胶用量: {silicone_cm3:.1f} cm³ ≈ {silicone_g:.1f} g  |  "
         f"模具: {mold_x:.0f}×{mold_y:.0f}×{mold_z:.0f} mm {'✓' if fits_printer else '⚠ 超出打印机'}",
-        f"(CT 体素 {ct_min_spacing:.2f}mm，MHD/HD95 阈值已自适应)",
+        f"(CT 体素 {ct_max_spacing:.2f}mm，MHD/HD95 阈值已自适应)",
         f"{'✓ PASS' if ok else '✗ FAIL'}",
     ]
     for line in lines:
@@ -1139,7 +1318,7 @@ def execute_validate(config):
          "  → 重新生成模具；若比值持续偏大，检查 Bolus_Expanded 段是否意外保留在场景中。"),
         ("最小壳厚", shell_thick_ok,
          f"模具最薄处壁厚，需 ≥{MIN_PRINT_THICKNESS_MM:.0f}mm 保证 3D 打印强度。",
-         f"当前最薄处 {min_shell_mm:.2f}mm，CT 体素 {ct_min_spacing:.2f}mm 导致 Margin 膨胀精度不足。\n"
+         f"当前最薄处 {min_shell_mm:.2f}mm，CT 体素 {ct_max_spacing:.2f}mm 导致 Margin 膨胀精度不足。\n"
          f"  → 在第 6 步将壳厚设定值调高至 {shell_mm + 1.0:.0f}mm（实际膨胀后约 {min_shell_mm + 1.0:.1f}mm）。"),
         ("非流形边", geom_ok,
          "模具网格是否为封闭流形（无洞、无自交），封闭才能正确切片打印。",
@@ -1169,7 +1348,7 @@ def execute_validate(config):
         "silicone_g": silicone_g,
         "mold_dims_mm": [round(mold_x, 1), round(mold_y, 1), round(mold_z, 1)],
         "fits_printer": fits_printer,
-        "ct_voxel_min_mm": round(ct_min_spacing, 3),
+        "ct_voxel_max_mm": round(ct_max_spacing, 3),
         "thresholds": {
             "MHD_mm": round(mhd_thr, 3),
             "HD95_mm": round(hd95_thr, 3),

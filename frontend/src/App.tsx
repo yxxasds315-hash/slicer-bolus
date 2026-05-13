@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import type { PipelineConfig, LogEntry, PipelineStatus, SlicerState, MoldStatus, ValidateStatus, ValidateResult, BolusInfo } from './types';
+import type { PipelineConfig, LogEntry, PipelineStatus, SlicerState, MoldStatus, ValidateStatus, ValidateResult, BolusInfo, MoldResult } from './types';
 import { WizardLayout } from './components/WizardLayout';
 import { DicomSelector } from './components/DicomSelector';
 import { SegmentationPanel, type PreviewStatus } from './components/SegmentationPanel';
@@ -24,6 +24,7 @@ const defaultConfig: PipelineConfig = {
   mold_sprue_radius_mm: 3.0,
   mold_vent_radius_mm: 1.0,
   mold_with_sprue: true,
+  mold_type: 'closed',
 };
 
 type ConnStatus = 'checking' | 'online' | 'offline' | 'no_watcher' | 'launching';
@@ -41,6 +42,8 @@ export default function App() {
   const [previewError, setPreviewError] = useState('');
   const [moldStatus, setMoldStatus] = useState<MoldStatus>('idle');
   const [moldError, setMoldError] = useState('');
+  const [ventWarning, setVentWarning] = useState(false);
+  const [openTopDirection, setOpenTopDirection] = useState<string | null>(null);
   const [validateStatus, setValidateStatus] = useState<ValidateStatus>('idle');
   const [validateResult, setValidateResult] = useState<ValidateResult | null>(null);
   const [validateError, setValidateError] = useState('');
@@ -110,7 +113,7 @@ export default function App() {
       setMoldError(`厚度已从 ${pipelineThickness}mm 改为 ${config.thickness_mm}mm，场景中的 Bolus_${pipelineThickness}mm 与当前设置不匹配。请返回第 5 步重新执行流水线。`);
       return;
     }
-    setMoldStatus('running'); setMoldError(''); try { const r = await fetch('/api/mold/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '模具生成失败'); } setMoldStatus('completed'); } catch (err: any) { setMoldStatus('error'); setMoldError(err.message); }
+    setMoldStatus('running'); setMoldError(''); setVentWarning(false); setOpenTopDirection(null); try { const r = await fetch('/api/mold/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '模具生成失败'); } const d = await r.json(); const result: MoldResult | undefined = d.output_files?.[0]; if (result?.vent_ok === false) setVentWarning(true); if (result?.open_top_direction) setOpenTopDirection(result.open_top_direction); setMoldStatus('completed'); } catch (err: any) { setMoldStatus('error'); setMoldError(err.message); }
   };
   const handleValidate = async () => { setValidateStatus('running'); setValidateError(''); setValidateResult(null); try { const r = await fetch('/api/validate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); if (!r.ok) { const e = await r.json(); throw new Error(e.detail || '评估失败'); } const d = await r.json(); const result = d.output_files?.[0]; if (result && result.status) { setValidateResult(result); setValidateStatus('completed'); } else { throw new Error('返回数据格式异常'); } } catch (err: any) { setValidateStatus('error'); setValidateError(err.message); } };
 
@@ -181,7 +184,7 @@ export default function App() {
       case 3: return <RoiSelector config={config} onChange={updateConfig} slicer={slicer} />;
       case 4: return <BolusDesigner config={config} onChange={updateConfig} />;
       case 5: return <ExecutionPanel config={config} status={pipeStatus} logs={logs} onExecute={executePipeline} slicer={slicer} bolusInfo={bolusInfo} />;
-      case 6: return <MoldGenerator config={config} onChange={updateConfig} onGenerate={handleMold} moldStatus={moldStatus} moldError={moldError} />;
+      case 6: return <MoldGenerator config={config} onChange={updateConfig} onGenerate={handleMold} moldStatus={moldStatus} moldError={moldError} ventWarning={ventWarning} openTopDirection={openTopDirection} />;
       case 7: return <ValidatePanel config={config} onValidate={handleValidate} validateStatus={validateStatus} validateResult={validateResult} validateError={validateError} />;
       case 8: return <ExportPanel config={config} onChange={updateConfig} slicer={slicer} />;
     }
