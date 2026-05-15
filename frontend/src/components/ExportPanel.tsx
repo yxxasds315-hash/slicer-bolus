@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import type { PipelineConfig, SlicerState } from '../types';
 import { useBrowseFolder } from '../hooks/useBrowseFolder';
 
@@ -29,6 +29,15 @@ export function ExportPanel({ config, onChange, slicer }: Props) {
       candidates.push({ name: m.name, source: `模型 ${m.vertices} 顶点` });
     }
   }
+
+  // 首次有 candidates 时默认全选；之后用户可自由勾选/取消
+  const initRef = useRef(false);
+  useEffect(() => {
+    if (!initRef.current && candidates.length > 0) {
+      setSelected(new Set(candidates.map((c) => c.name)));
+      initRef.current = true;
+    }
+  }, [candidates.length]);
 
   const toggle = (name: string) => {
     const next = new Set(selected);

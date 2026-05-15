@@ -36,10 +36,12 @@ export function SegmentationPanel({ config, onChange, onPreview, onScissors, onS
         <div className="bg-warning/10 border border-warning/30 rounded-lg p-4 space-y-3">
           <div className="flex items-center gap-2"><span className="text-lg">⚠️</span><span className="text-sm text-warning font-medium">检查是否需要剪切床板</span></div>
           <p className="text-xs text-medical-400">阈值可能包含治疗床/头枕，请在 Slicer 2D 视图检查。</p>
-          <div className="flex gap-3">
-            <button onClick={onScissors} className="flex-1 py-2 px-4 bg-warning/20 border border-warning/50 text-warning rounded-lg text-sm font-medium hover:bg-warning/30 transition-colors">✂️ 剪裁</button>
-            <button onClick={onSolidify} className="flex-1 py-2 px-4 bg-medical-600 text-medical-300 rounded-lg text-sm hover:bg-medical-500 transition-colors">跳过剪裁，直接实心化 →</button>
+          <div className="grid grid-cols-3 gap-2">
+            <button onClick={onScissors} className="py-2 px-3 bg-warning/20 border border-warning/50 text-warning rounded-lg text-xs font-medium hover:bg-warning/30 transition-colors">✂️ 剪裁</button>
+            <button onClick={onSolidify} className="py-2 px-3 bg-medical-600 text-medical-300 rounded-lg text-xs hover:bg-medical-500 transition-colors">跳过剪裁→实心化</button>
+            <button onClick={onFinalize} className="py-2 px-3 bg-medical-700 text-medical-400 rounded-lg text-xs hover:bg-medical-600 transition-colors" title="四肢/后背等无气腔区域适用，跳过实心化和封口">跳过实心化→</button>
           </div>
+          <p className="text-xs text-medical-500">"跳过实心化"适用于四肢/后背等<strong className="text-medical-300">无内部气腔</strong>区域；头/胸跳过会触发后端 warning</p>
         </div>
       )}
 
@@ -47,7 +49,10 @@ export function SegmentationPanel({ config, onChange, onPreview, onScissors, onS
         <div className="bg-accent-400/10 border border-accent-400/30 rounded-lg p-4 space-y-3">
           <div className="flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-accent-400 animate-pulse" /><span className="text-sm text-accent-300 font-medium">Scissors 已激活</span></div>
           <p className="text-xs text-medical-400">请在 Slicer <strong className="text-white">2D 切片视图</strong>中切断身体与床板的粘连，完成后点下方按钮。</p>
-          <button onClick={onSolidify} className="w-full py-2.5 bg-accent-400 text-medical-900 rounded-lg text-sm font-bold hover:bg-accent-300 transition-colors">完成剪裁，执行实心化</button>
+          <div className="flex gap-3">
+            <button onClick={onSolidify} className="flex-1 py-2.5 bg-accent-400 text-medical-900 rounded-lg text-sm font-bold hover:bg-accent-300 transition-colors">完成剪裁→实心化</button>
+            <button onClick={onFinalize} className="flex-1 py-2 px-4 bg-medical-700 text-medical-400 rounded-lg text-sm hover:bg-medical-600 transition-colors" title="四肢/后背场景">完成→跳过实心化</button>
+          </div>
         </div>
       )}
 

@@ -4,7 +4,7 @@ export interface PipelineConfig {
   thickness_mm: number;
   smoothing_method: 'MEDIAN' | 'GAUSSIAN' | 'MORPHOLOGICAL_OPENING' | 'JOINT_TAUBIN';
   smoothing_kernel_mm: number;
-  design_method: 'offset_subtract' | 'hollow';
+  design_method: 'offset_subtract';
   roi_mode: 'full_skin' | 'slicer_roi';
   roi_segment_id: string;
   seal_kernel_1_mm: number;
