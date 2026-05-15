@@ -27,6 +27,7 @@ const defaultConfig: PipelineConfig = {
   mold_type: 'closed',
   opening_dir: 'S',
   mold_base_plate: false,
+  mold_base_plate_mm: 3,
 };
 
 type ConnStatus = 'checking' | 'online' | 'offline' | 'no_watcher' | 'launching';

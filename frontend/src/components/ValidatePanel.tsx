@@ -34,7 +34,7 @@ const METRICS: MetricSpec[] = [
     key: 'min_shell_thickness_mm', label: '最小壳厚', unit: 'mm',
     fmt: (v) => v.toFixed(2),
     ok: (v, t) => v >= t.min_shell_thickness_mm,
-    target: (t) => `≥ ${t.min_shell_thickness_mm.toFixed(0)}`,
+    target: (t) => `≥ ${t.min_shell_thickness_mm.toFixed(1)}`,
   },
   {
     key: 'non_manifold_edges', label: '非流形边', unit: '',

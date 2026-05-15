@@ -67,8 +67,8 @@ export function MoldGenerator({ config, onChange, onGenerate, moldStatus, moldEr
 
         <div className="border-t border-medical-700 pt-4">
           <div className="flex justify-between mb-1.5"><label className="text-sm text-medical-400">壳体壁厚</label><span className="text-sm font-mono text-accent-300">{config.mold_shell_thickness_mm} mm</span></div>
-          <input type="range" min={3} max={10} step={0.5} value={config.mold_shell_thickness_mm} onChange={(e) => onChange({ mold_shell_thickness_mm: Number(e.target.value) })} className="slider-medical" />
-          <p className="text-xs text-medical-500 mt-0.5">最小 3mm（≥ 3mm 保证打印强度）</p>
+          <input type="range" min={1.2} max={10} step={0.4} value={config.mold_shell_thickness_mm} onChange={(e) => onChange({ mold_shell_thickness_mm: Number(e.target.value) })} className="slider-medical" />
+          <p className="text-xs text-medical-500 mt-0.5">0.4mm 喷嘴 · 3 层墙=1.2mm｜4 层=1.6mm｜5 层=2.0mm（越薄越易脱模，但需 CT voxel ≤ 1.0mm 才稳定）</p>
         </div>
 
         {config.mold_type === 'closed' && (
@@ -101,18 +101,33 @@ export function MoldGenerator({ config, onChange, onGenerate, moldStatus, moldEr
         )}
 
         <div className="border-t border-medical-700 pt-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <h4 className="text-xs font-medium text-medical-400">底板（1mm）</h4>
-              <p className="text-xs text-medical-500 mt-0.5">在模具底部围绕最小投影添加 1mm 平板，增强放置稳定性</p>
+          {config.mold_type === 'open_top' ? (
+            <>
+              <div className="flex items-center justify-between mb-2">
+                <div>
+                  <h4 className="text-xs font-medium text-medical-400">底板（开口反方向，3D 打印站立稳定性）</h4>
+                  <p className="text-xs text-medical-500 mt-0.5">嵌入模具 2mm + 外扩 5mm 裙边，与模具一体打印</p>
+                </div>
+                <button
+                  onClick={() => onChange({ mold_base_plate: !config.mold_base_plate })}
+                  className={`relative w-10 h-5 rounded-full transition-colors ${config.mold_base_plate ? 'bg-accent-400' : 'bg-medical-600'}`}
+                >
+                  <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${config.mold_base_plate ? 'left-5' : 'left-0.5'}`} />
+                </button>
+              </div>
+              {config.mold_base_plate && (
+                <div className="mt-3">
+                  <div className="flex justify-between mb-1.5"><label className="text-xs text-medical-400">底板厚度</label><span className="text-xs font-mono text-accent-300">{config.mold_base_plate_mm} mm</span></div>
+                  <input type="range" min={2} max={5} step={1} value={config.mold_base_plate_mm} onChange={(e) => onChange({ mold_base_plate_mm: Number(e.target.value) })} className="slider-medical" />
+                  <p className="text-xs text-medical-500 mt-0.5">2mm（5 层墙，轻量）｜3mm（推荐）｜5mm（重型）</p>
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="bg-medical-900/40 border border-medical-700 rounded-md px-3 py-2.5">
+              <p className="text-xs text-medical-500">封闭式暂不支持底板（无明确"底面"方向）。如需底板，请切换为「顶开式」。</p>
             </div>
-            <button
-              onClick={() => onChange({ mold_base_plate: !config.mold_base_plate })}
-              className={`relative w-10 h-5 rounded-full transition-colors ${config.mold_base_plate ? 'bg-accent-400' : 'bg-medical-600'}`}
-            >
-              <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${config.mold_base_plate ? 'left-5' : 'left-0.5'}`} />
-            </button>
-          </div>
+          )}
         </div>
       </div>
 

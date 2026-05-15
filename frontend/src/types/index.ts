@@ -16,6 +16,7 @@ export interface PipelineConfig {
   mold_type: 'closed' | 'open_top';
   opening_dir: 'S' | 'I' | 'A' | 'P' | 'L' | 'R' | 'auto';
   mold_base_plate: boolean;
+  mold_base_plate_mm: number;
 }
 
 export interface BolusInfo {

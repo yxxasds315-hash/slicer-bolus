@@ -171,11 +171,6 @@ def execute_pipeline(config):
         bounds[min_axis*2] = center - safe_depth / 2.0
         bounds[min_axis*2 + 1] = center + safe_depth / 2.0
 
-    # cutter 在所有轴上外扩 2x bolus 厚度，确保膨胀后的 bolus 完全落入裁切范围
-    for i in range(3):
-        bounds[i*2] -= BOLUS_THICKNESS * 2
-        bounds[i*2 + 1] += BOLUS_THICKNESS * 2
-
     cube = vtk.vtkCubeSource()
     cube.SetBounds(bounds)
     cube.Update()
@@ -665,6 +660,67 @@ def _get_segment_polydata(seg_node, segment_name):
     return poly
 
 
+def _mask_to_polydata(mask, ref_volume, zoom_z=1, crop_offset_zyx=(0, 0, 0)):
+    """numpy mask (z, y, x) → polydata in RAS。
+
+    用于绕过 segmentation closed surface representation 的体素分辨率限制：直接在
+    高分辨率 numpy 上跑 marching cubes，再用 ref_volume 的 IJK→RAS 矩阵把 mesh
+    搬到 RAS 物理坐标。
+
+    zoom_z: Z 方向上采样倍数（mask shape = (orig_z * zoom_z, y, x)）。zoom_z=1 时
+    退化为常规体素。SBI 高分辨率时 zoom_z>1，vtkImageData 用 1/zoom_z 的 Z 步长，
+    使 polydata 顶点直接落在原 IJK 的小数索引上，再被 IJK→RAS 矩阵转回 RAS。
+
+    crop_offset_zyx: 若 mask 是从 ref_volume 全体素裁切出的子数组，传入裁切起点
+    (z_lo, y_lo, x_lo)（低分辨率原 IJK 单位）让 polydata 落在正确 RAS 位置。
+    vtk 把它作为 vtkImageData 的 origin（X/Y 对应 i/j，Z 对应 k）。
+    """
+    import numpy as np
+    arr = np.ascontiguousarray(mask.astype(np.uint8))
+    z, y, x = arr.shape
+    z_off, y_off, x_off = crop_offset_zyx
+
+    img = vtk.vtkImageImport()
+    img.SetDataScalarTypeToUnsignedChar()
+    img.SetNumberOfScalarComponents(1)
+    img.SetWholeExtent(0, x - 1, 0, y - 1, 0, z - 1)
+    img.SetDataExtent(0, x - 1, 0, y - 1, 0, z - 1)
+    img.CopyImportVoidPointer(arr.tobytes(), arr.nbytes)
+    img.SetDataSpacing(1.0, 1.0, 1.0 / zoom_z)
+    img.SetDataOrigin(float(x_off), float(y_off), float(z_off))
+    img.Update()
+
+    mc = vtk.vtkDiscreteMarchingCubes()
+    mc.SetInputConnection(img.GetOutputPort())
+    mc.GenerateValues(1, 1, 1)
+    mc.ComputeNormalsOff()
+    mc.Update()
+
+    ijk_to_ras = vtk.vtkMatrix4x4()
+    ref_volume.GetIJKToRASMatrix(ijk_to_ras)
+    transform = vtk.vtkTransform()
+    transform.SetMatrix(ijk_to_ras)
+
+    tf = vtk.vtkTransformPolyDataFilter()
+    tf.SetInputConnection(mc.GetOutputPort())
+    tf.SetTransform(transform)
+    tf.Update()
+
+    # 平滑去 marching cubes 体素阶梯。passband 越小越激进；对体素直角三角形需要 ≤0.01。
+    # BoundarySmoothing=off：保留开顶切口的清洁边界，不被圆化。
+    # 评估的最小壳厚走 EDT 体素直接计算（不经过本 polydata），所以这里可放心激进平滑。
+    smooth = vtk.vtkWindowedSincPolyDataFilter()
+    smooth.SetInputConnection(tf.GetOutputPort())
+    smooth.SetNumberOfIterations(60)
+    smooth.SetPassBand(0.01)
+    smooth.BoundarySmoothingOff()
+    smooth.FeatureEdgeSmoothingOff()
+    smooth.NonManifoldSmoothingOff()
+    smooth.NormalizeCoordinatesOn()
+    smooth.Update()
+    return smooth.GetOutput()
+
+
 def _poly_boolean(poly_a, poly_b, operation):
     def _triangulate(poly):
         tri = vtk.vtkTriangleFilter()
@@ -837,31 +893,31 @@ def _detect_bolus_outward_direction(bolus_arr, skin_arr, spacing_zyx):
     return axis, +1, extents_mm.tolist(), [0.0, 0.0, 0.0], "bbox-fallback"
 
 
-def _strip_top_plate(seg_node, bolus_id, female_id, ref_volume, shell_mm, skin_id=None, opening_dir=None):
-    """在 labelmap 空间沿指定方向移除模具顶板，生成顶开式模具。
+def _strip_top_plate_numpy(mold_arr, bolus_arr, skin_arr, spacing_zyx, ref_volume, shell_mm, opening_dir=None):
+    """纯 numpy: 沿 ref_volume 解剖方向移除模具顶板。
 
-    顶板定义：mold 在该方向上全局最外侧 shell_mm 厚的体素层。
-    移除该层使内腔从选定方向敞开，侧壁不受影响。
+    输入 mold/bolus/skin 必须 same shape；spacing_zyx 与之匹配（高分辨率 SBI 时为
+    上采样后的 spacing）。ref_volume 仅用于解剖方向→numpy 轴号的转换（IJK→RAS
+    direction matrix），不读其 labelmap，所以高分辨率 numpy 数组也能用。
+
+    顶板定义：mold 在该方向上全局最外侧 shell_mm 厚的体素层（按 spacing_zyx 折算
+    层数）。移除该层使内腔从选定方向敞开，侧壁不受影响。
 
     opening_dir: 解剖方向标签 S/I/A/P/L/R（优先），None 时自动检测（bolus 最近 skin 法向）。
 
-    执行前先计算并 log 6 个解剖面的面积（cm²），辅助方向选择。
-    返回方向标签（如 "+Z(S)"）供日志和前端展示。
+    执行前先 log 6 个解剖面的面积（cm²）辅助方向选择。
+    返回 (mold_arr_open, dir_label)。mold/bolus 任一为空时返回 (mold_arr, None)。
     """
     import numpy as np
-    bolus_arr = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, bolus_id, ref_volume).astype(bool)
-    mold_arr  = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, female_id, ref_volume).astype(bool)
 
     if not bolus_arr.any():
-        to_log("warning", "  ⚠ bolus labelmap 为空，跳过开顶")
-        return None
+        to_log("warning", "  ⚠ bolus 数组为空，跳过开顶")
+        return mold_arr, None
     if not mold_arr.any():
-        to_log("warning", "  ⚠ mold labelmap 为空，跳过开顶")
-        return None
+        to_log("warning", "  ⚠ mold 数组为空，跳过开顶")
+        return mold_arr, None
 
-    # GetSpacing 返回 (sx, sy, sz)；numpy axis 顺序为 (z, y, x)
-    sx, sy, sz = ref_volume.GetSpacing()
-    spacing_zyx = np.array([sz, sy, sx])
+    spacing_zyx = np.asarray(spacing_zyx, dtype=float)
     axis_labels = ["Z", "Y", "X"]
     shape = mold_arr.shape
 
@@ -889,9 +945,6 @@ def _strip_top_plate(seg_node, bolus_id, female_id, ref_volume, shell_mm, skin_i
         to_log("info", f"    {label}({ad}): {area_cm2:.1f} cm²")
 
     # ── 确定开口方向 ──
-    skin_arr = None
-    if skin_id:
-        skin_arr = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, skin_id, ref_volume).astype(bool)
     outward_axis, outward_sign, extents_mm, mean_offsets_mm, method = _detect_bolus_outward_direction(
         bolus_arr, skin_arr, spacing_zyx
     )
@@ -918,11 +971,8 @@ def _strip_top_plate(seg_node, bolus_id, female_id, ref_volume, shell_mm, skin_i
 
     mold_open = mold_arr & ~to_remove
     removed = int(to_remove.sum())
-    slicer.util.updateSegmentBinaryLabelmapFromArray(
-        mold_open.astype(np.uint8), seg_node, female_id, ref_volume
-    )
     to_log("info", f"  [开顶] 沿 {dir_label} 移除顶板 {removed} 体素（{n_slices} 层 ≈ {shell_mm}mm）")
-    return dir_label
+    return mold_open, dir_label
 
 
 def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm, open_top=False, opening_dir=None):
@@ -941,7 +991,7 @@ def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm, open_top=False,
     """
     to_log("info", f"── 阴模生成（{'顶开式' if open_top else '封闭式'}）──")
     import numpy as np
-    from scipy.ndimage import distance_transform_edt
+    from scipy.ndimage import distance_transform_edt, zoom as ndi_zoom
     seg = seg_node.GetSegmentation()
 
     bolus_id = seg.GetSegmentIdBySegmentName(bolus_name)
@@ -952,48 +1002,132 @@ def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm, open_top=False,
     if ref_volume is None:
         raise RuntimeError("场景中无体积数据，无法计算 EDT 壳体")
 
-    # 全 numpy 一次性计算阴模壳体：dist > 0（bolus 外侧）且 dist ≤ shell_mm（壳厚以内）
-    # 直接产出最终 Mold_Female labelmap，跳过 Bolus_Expanded 中间段，避免 Editor Widget
-    # 与 numpy 写入两套 labelmap geometry 不一致导致的 SUBTRACT 边界裁切问题。
-    arr_b = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, bolus_id, ref_volume).astype(bool)
+    bolus_arr = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, bolus_id, ref_volume).astype(bool)
     sx, sy, sz = ref_volume.GetSpacing()
-    dist = distance_transform_edt(~arr_b, sampling=(sz, sy, sx))
-    arr_mold = ((dist > 0) & (dist <= shell_mm)).astype(np.uint8)
-    to_log("info", f"  [EDT 壳体] 精确 {shell_mm}mm，{int(arr_mold.sum())} 体素")
 
+    if not bolus_arr.any():
+        raise RuntimeError(f"{bolus_name} segment 为空，无法生成模具")
+
+    # ── 裁切到 bolus bbox + padding ──
+    # 避免对全 CT 体积做 EDT/SBI（瓶颈在体素总数，非 bolus 大小）。
+    # padding ≥ shell_mm 保证 EDT 在 shell 范围内看到完整邻域；+2 voxel 缓冲 SBI 插值边界。
+    full_shape = bolus_arr.shape
+    bolus_idx = np.argwhere(bolus_arr)
+    bbox_lo = bolus_idx.min(axis=0)
+    bbox_hi = bolus_idx.max(axis=0) + 1
+    pad = np.array([
+        int(np.ceil(shell_mm / sz)) + 2,
+        int(np.ceil(shell_mm / sy)) + 2,
+        int(np.ceil(shell_mm / sx)) + 2,
+    ])
+    crop_lo = np.maximum(bbox_lo - pad, 0)
+    crop_hi = np.minimum(bbox_hi + pad, np.array(full_shape))
+    crop_shape = tuple(crop_hi - crop_lo)
+    saved = (1.0 - float(np.prod(crop_shape)) / float(np.prod(full_shape))) * 100.0
+    to_log("info", f"  [裁切] bolus bbox+pad → {crop_shape} 体素 "
+                   f"（全体积 {full_shape}，省 {saved:.1f}%）")
+    bolus_arr = bolus_arr[crop_lo[0]:crop_hi[0], crop_lo[1]:crop_hi[1], crop_lo[2]:crop_hi[2]]
+    crop_offset_zyx = tuple(int(v) for v in crop_lo)
+
+    # ── SBI 上采样判定 ──
+    # CT 各向异性（Z 远大于 X/Y）+ 薄壳（< 1.5×Z spacing）时启用 shape-based interpolation。
+    # SDF 线性插值 → 高分辨率 bolus mask；这是医学影像分割切片间插值的标准方法
+    # (Raya & Udupa 1990 IEEE TMI)。
+    z_aniso = sz / max(sx, sy)
+    use_sbi = z_aniso > 1.5 and shell_mm < sz * 1.5
+    if use_sbi:
+        # zoom_z 取两个条件的较大值：
+        #   ① ceil(z_aniso) — 把 Z 拉到 ≈ X/Y 分辨率
+        #   ② ceil(2×sz / shell_mm) — 保证上采样后 shell 能容纳 ≥ 2 voxel
+        # 否则壳在 Z 方向只有 1 voxel 厚，最薄壳厚 = sz_hr 而非 shell_mm，评估失败
+        zoom_z = max(int(np.ceil(z_aniso)),
+                     int(np.ceil(2.0 * sz / shell_mm)))
+        sz_hr = sz / zoom_z
+        to_log("info", f"  [SBI] CT 各向异性 Z/XY={z_aniso:.2f}，shell={shell_mm}mm < 1.5×Z spacing"
+                       f" → Z 方向上采样 ×{zoom_z}（{sz}mm → {sz_hr:.2f}mm，shell≈{shell_mm/sz_hr:.1f} voxel）")
+        sdf_b = (distance_transform_edt(~bolus_arr, sampling=(sz, sy, sx)) -
+                 distance_transform_edt(bolus_arr,  sampling=(sz, sy, sx)))
+        sdf_b_hr = ndi_zoom(sdf_b, (zoom_z, 1, 1), order=1)
+        bolus_hr = sdf_b_hr <= 0
+        spacing_hr = (sz_hr, sy, sx)
+    else:
+        zoom_z = 1
+        bolus_hr = bolus_arr
+        spacing_hr = (sz, sy, sx)
+        if shell_mm < max(sx, sy, sz) * 1.5:
+            to_log("warning", f"  ⚠ 壳厚 {shell_mm}mm 小于 1.5×CT 体素 ({max(sx, sy, sz):.2f}mm)，"
+                              f"且 CT 各向同性，EDT 量化可能产生壳体不连通")
+
+    # ── 高分辨率 EDT 算壳 ──
+    dist = distance_transform_edt(~bolus_hr, sampling=spacing_hr)
+    mold_hr = (dist > 0) & (dist <= shell_mm)
+    to_log("info", f"  [EDT 壳体] {shell_mm}mm，{int(mold_hr.sum()):,} {'高分辨率' if use_sbi else ''}体素")
+
+    # ── 顶开式：在 numpy 高分辨率上剥顶 ──
+    open_top_direction = None
+    if open_top:
+        skin_id = seg.GetSegmentIdBySegmentName(skin_name) if skin_name else None
+        if skin_id:
+            skin_arr = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, skin_id, ref_volume).astype(bool)
+            # 裁切到 bolus bbox 同一窗口（skin 在 bbox 外的部分对开口方向检测无影响）
+            skin_arr = skin_arr[crop_lo[0]:crop_hi[0], crop_lo[1]:crop_hi[1], crop_lo[2]:crop_hi[2]]
+            if use_sbi:
+                sdf_s = (distance_transform_edt(~skin_arr, sampling=(sz, sy, sx)) -
+                         distance_transform_edt(skin_arr,  sampling=(sz, sy, sx)))
+                skin_hr = ndi_zoom(sdf_s, (zoom_z, 1, 1), order=1) <= 0
+            else:
+                skin_hr = skin_arr
+        else:
+            skin_hr = None
+        mold_hr_open, open_top_direction = _strip_top_plate_numpy(
+            mold_hr, bolus_hr, skin_hr, spacing_hr, ref_volume, shell_mm, opening_dir=opening_dir
+        )
+    else:
+        mold_hr_open = mold_hr
+
+    # ── 写一份下采样低分辨率 labelmap 到 segmentation（Slicer 显示和兼容用）──
+    # 用 max-pool（只要任一高分辨率体素为 1，低分辨率体素就为 1），保持壳体连续性
     female_name = "Mold_Female"
     old_female = seg.GetSegmentIdBySegmentName(female_name)
     if old_female:
         seg.RemoveSegment(old_female)
     female_id = seg.AddEmptySegment(female_name, female_name)
     seg.CreateRepresentation(slicer.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName())
-    slicer.util.updateSegmentBinaryLabelmapFromArray(arr_mold, seg_node, female_id, ref_volume)
-    to_log("info", f"  [写入] {female_name}（壳厚 {shell_mm}mm）")
 
-    def _extract_and_normalize():
-        """从 female_name 当前 labelmap 提取 polydata 并修正法线一致性。
+    if use_sbi:
+        Z_hr = mold_hr_open.shape[0]
+        Z_lr = Z_hr // zoom_z
+        mold_lr_crop = mold_hr_open[:Z_lr * zoom_z].reshape(Z_lr, zoom_z, *mold_hr_open.shape[1:]).max(axis=1)
+    else:
+        mold_lr_crop = mold_hr_open
+    # 把裁切结果 paste 进全体素零数组，让 Slicer segment labelmap 几何与 ref_volume 一致
+    mold_lr_full = np.zeros(full_shape, dtype=np.uint8)
+    mold_lr_full[crop_lo[0]:crop_lo[0] + mold_lr_crop.shape[0],
+                 crop_lo[1]:crop_lo[1] + mold_lr_crop.shape[1],
+                 crop_lo[2]:crop_lo[2] + mold_lr_crop.shape[2]] = mold_lr_crop.astype(np.uint8)
+    slicer.util.updateSegmentBinaryLabelmapFromArray(mold_lr_full, seg_node, female_id, ref_volume)
+    to_log("info", f"  [写入] {female_name}（{'SBI 高分辨率 mesh + 下采样' if use_sbi else '原分辨率'} labelmap）")
 
-        关键：_get_segment_polydata 内部只在 GetClosedSurfaceRepresentation 返回空时
-        才 Create，因此一旦该 segment 已有 closed surface 缓存，labelmap 后续被
-        _strip_top_plate 改写后第二次调用会返回 stale 几何。这里显式移除该 segment
-        的 closed surface 表示，强制 Create 从当前 labelmap 重建。
-        """
-        seg = seg_node.GetSegmentation()
-        cs_name = slicer.vtkSegmentationConverter.GetClosedSurfaceRepresentationName()
-        seg_obj = seg.GetSegment(seg.GetSegmentIdBySegmentName(female_name))
-        if seg_obj:
-            seg_obj.RemoveRepresentation(cs_name)
-        seg_node.CreateClosedSurfaceRepresentation()
-        poly = _get_segment_polydata(seg_node, female_name)
+    # ── 直接从高分辨率 numpy mask 重建 polydata，绕过 segmentation 体素分辨率限制 ──
+    def _normalize(p):
+        # 显式 ComputePointNormalsOn + AutoOrientNormalsOn：
+        # 保证 Slicer 用 Gouraud 平滑着色（per-vertex），不会按三角面 facet 着色（即便几何已平滑也会显得阶梯）。
         n = vtk.vtkPolyDataNormals()
-        n.SetInputData(poly)
+        n.SetInputData(p)
+        n.ComputePointNormalsOn()
+        n.ComputeCellNormalsOff()
+        n.SetFeatureAngle(60.0)
         n.ConsistencyOn()
+        n.AutoOrientNormalsOn()
         n.SplittingOff()
         n.Update()
         return n.GetOutput()
 
-    # 第一次提取：纯封闭壳，validate 用
-    closed_poly = _extract_and_normalize()
+    closed_poly = _normalize(_mask_to_polydata(mold_hr,      ref_volume, zoom_z=zoom_z, crop_offset_zyx=crop_offset_zyx))
+    final_poly  = closed_poly if not open_top else _normalize(
+        _mask_to_polydata(mold_hr_open, ref_volume, zoom_z=zoom_z, crop_offset_zyx=crop_offset_zyx)
+    )
+
     fe0 = vtk.vtkFeatureEdges()
     fe0.SetInputData(closed_poly)
     fe0.BoundaryEdgesOn(); fe0.NonManifoldEdgesOn()
@@ -1003,12 +1137,7 @@ def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm, open_top=False,
     to_log("info", f"  [封闭壳] {closed_poly.GetNumberOfPoints():,} pts，开放边: {n_open_closed} "
                    f"({'封闭' if n_open_closed == 0 else '⚠ 有缺口（不应发生）'})")
 
-    open_top_direction = None
     if open_top:
-        # 在 labelmap 空间剥顶后再次提取，闭合壳 polydata 已抓住，不受影响
-        skin_id = seg.GetSegmentIdBySegmentName(skin_name) if skin_name else None
-        open_top_direction = _strip_top_plate(seg_node, bolus_id, female_id, ref_volume, shell_mm, skin_id=skin_id, opening_dir=opening_dir)
-        final_poly = _extract_and_normalize()
         fe1 = vtk.vtkFeatureEdges()
         fe1.SetInputData(final_poly)
         fe1.BoundaryEdgesOn(); fe1.NonManifoldEdgesOn()
@@ -1017,9 +1146,6 @@ def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm, open_top=False,
         n_open_final = fe1.GetOutput().GetNumberOfCells()
         to_log("info", f"  [开顶版] {final_poly.GetNumberOfPoints():,} pts，开放边: {n_open_final} "
                        f"(顶部敞开方向 {open_top_direction})")
-    else:
-        # 封闭模式：两份引用同一 polydata，避免复制
-        final_poly = closed_poly
 
     return closed_poly, final_poly, open_top_direction
 
@@ -1125,62 +1251,74 @@ def _add_sprue_and_vents(female_poly, sprue_radius_mm, vent_radius_mm, shell_mm,
     return result, vent_ok
 
 
-def _add_base_plate(female_poly, bolus_id, seg_node, ref_volume, plate_mm=1.0):
-    """在阴模底部（anti-outward方向）添加 plate_mm 厚平板，围绕 bolus 最小投影范围。
+def _add_base_plate(female_poly, opening_dir, plate_mm=3.0, border_mm=5.0):
+    """在 opening_dir 反方向添加 plate_mm 厚底板（顶开式专用）。
 
-    outward 方向检测逻辑与 _strip_top_plate 保持一致。
-    底板在 anti-outward 端，与顶开式开口和 sprue/vent 均处于对侧，不产生冲突。
+    设计：
+      - 方向：opening_dir（如 "+Z" 或 "+Z(S)"）取反，不重新探测
+      - 形状：mold bbox + border_mm 外扩（提供站立稳定性的裙边）
+      - 厚度：plate_mm（默认 3mm，约 7-8 层 0.4mm 墙）
+      - 嵌入：底板深入 mold 内部 2mm，保证切片软件 flood fill 识别为一体
+      - 合并：vtkAppendPolyData（避免 vtkBooleanOperationPolyDataFilter 对薄壳易失败的问题；
+        STL 是无对象概念的三角形列表，重叠 ≥0 切片软件均识别为一个固体）
     """
-    import numpy as np
-
-    bolus_arr = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, bolus_id, ref_volume).astype(bool)
-    if not bolus_arr.any():
-        to_log("warning", "  ⚠ [底板] bolus labelmap 为空，跳过底板")
+    if not opening_dir or len(opening_dir) < 2:
+        to_log("warning", "  [底板] 未传入有效 opening_dir，跳过")
         return female_poly
 
-    sx, sy, sz = ref_volume.GetSpacing()
-    spacing_zyx = np.array([sz, sy, sx])
-    axis_labels = ["Z", "Y", "X"]
+    sign_char = opening_dir[0]
+    axis_char = opening_dir[1]
+    if sign_char not in ('+', '-') or axis_char not in ('X', 'Y', 'Z'):
+        to_log("warning", f"  [底板] opening_dir '{opening_dir}' 格式不识别（期望 +X/-X/+Y/-Y/+Z/-Z 开头），跳过")
+        return female_poly
 
-    skin_arr = None
-    skin_id = seg_node.GetSegmentation().GetSegmentIdBySegmentName(SEG["skin"])
-    if skin_id:
-        skin_arr = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, skin_id, ref_volume).astype(bool)
-    outward_axis, outward_sign, _, _, _ = _detect_bolus_outward_direction(
-        bolus_arr, skin_arr, spacing_zyx
-    )
+    # opening 在 +Z → 底板在 -Z 端；反之亦然
+    plate_sign = -1 if sign_char == '+' else +1
+    axis_idx = {'X': 0, 'Y': 1, 'Z': 2}[axis_char]   # vtk bounds 顺序
 
-    # vtk bounds [xmin,xmax,ymin,ymax,zmin,zmax]; numpy z=0→vtk(4,5); y=1→(2,3); x=2→(0,1)
-    _vtk_lo = {0: 4, 1: 2, 2: 0}
-    _vtk_hi = {0: 5, 1: 3, 2: 1}
-    b = female_poly.GetBounds()
-    lo = b[_vtk_lo[outward_axis]]
-    hi = b[_vtk_hi[outward_axis]]
-
-    # 与模具底面重叠 0.5mm：避免 VTK 布尔在零体积接触面（共面无交集）失败或产生非流形边
-    overlap_mm = 0.5
-    if outward_sign > 0:
-        plate_near, plate_far = lo - plate_mm, lo + overlap_mm
+    overlap_mm = 2.0  # 底板嵌入 mold 的深度，切片软件 flood fill 识别为一体
+    b = list(female_poly.GetBounds())  # [xmin, xmax, ymin, ymax, zmin, zmax]
+    bound_lo = b[axis_idx * 2]
+    bound_hi = b[axis_idx * 2 + 1]
+    if plate_sign > 0:
+        plate_near = bound_hi - overlap_mm
+        plate_far  = bound_hi + plate_mm
     else:
-        plate_near, plate_far = hi - overlap_mm, hi + plate_mm
+        plate_near = bound_lo - plate_mm
+        plate_far  = bound_lo + overlap_mm
+
+    # 裙边：除底板厚度方向外，所有方向外扩 border_mm
+    cube_bounds = list(b)
+    for i in range(3):
+        if i == axis_idx:
+            cube_bounds[i*2]     = plate_near
+            cube_bounds[i*2 + 1] = plate_far
+        else:
+            cube_bounds[i*2]     -= border_mm
+            cube_bounds[i*2 + 1] += border_mm
 
     cube = vtk.vtkCubeSource()
-    if outward_axis == 0:    # Z
-        cube.SetBounds(b[0], b[1], b[2], b[3], plate_near, plate_far)
-    elif outward_axis == 1:  # Y
-        cube.SetBounds(b[0], b[1], plate_near, plate_far, b[4], b[5])
-    else:                    # X
-        cube.SetBounds(plate_near, plate_far, b[2], b[3], b[4], b[5])
+    cube.SetBounds(*cube_bounds)
     cube.Update()
 
-    result = _poly_boolean(female_poly, cube.GetOutput(), "union")
-    if result.GetNumberOfPoints() == 0:
-        to_log("warning", "  ⚠ [底板] union 失败，保留原模具")
-        return female_poly
+    appender = vtk.vtkAppendPolyData()
+    appender.AddInputData(female_poly)
+    appender.AddInputData(cube.GetOutput())
+    appender.Update()
 
-    dir_label = f"{'+' if outward_sign > 0 else '-'}{axis_labels[outward_axis]}"
-    to_log("info", f"  [底板] {plate_mm}mm 底板已合并于 {dir_label} 轴底端")
-    return result
+    tri = vtk.vtkTriangleFilter()
+    tri.SetInputConnection(appender.GetOutputPort())
+    tri.Update()
+
+    norm = vtk.vtkPolyDataNormals()
+    norm.SetInputData(tri.GetOutput())
+    norm.ConsistencyOn(); norm.AutoOrientNormalsOn(); norm.SplittingOff()
+    norm.Update()
+
+    to_log("info", f"  [底板] {plate_mm}mm 厚 + bbox 外扩 {border_mm}mm 裙边，"
+                   f"位于 opening_dir {opening_dir} 反方向（plate_sign={'+' if plate_sign>0 else '-'}{axis_char}），"
+                   f"嵌入 mold {overlap_mm}mm，vtkAppendPolyData 合并")
+    return norm.GetOutput()
 
 
 def execute_mold(config):
@@ -1240,9 +1378,11 @@ def execute_mold(config):
             to_log("info", "  跳过注料口 & 排气孔")
 
         if d.get("mold_base_plate", False):
-            bolus_id = seg.GetSegmentIdBySegmentName(bolus_name)
-            ref_volume = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
-            female = _add_base_plate(female, bolus_id, seg_node, ref_volume)
+            if mold_type != "open_top" or not open_top_direction:
+                to_log("warning", "  [底板] 仅顶开式 + 已确定开口方向时启用，本次跳过")
+            else:
+                plate_mm = float(d.get("mold_base_plate_mm", 3.0))
+                female = _add_base_plate(female, open_top_direction, plate_mm=plate_mm)
 
         _add_model_to_scene(female, "Mold_Female_Conformal", color=(0.87, 0.49, 0.33), opacity=0.75)
 
@@ -1298,9 +1438,10 @@ def execute_validate(config):
         raise RuntimeError("场景中无体积数据，无法读取 CT 体素分辨率")
     ct_max_spacing = max(max(vols[0].GetSpacing()), 0.1)
 
-    # 阈值随 CT 体素分辨率自适应：labelmap 管线单次误差约 1 体素，双向约 2 体素
-    mhd_thr  = max(1.0, ct_max_spacing * 2.0)
-    hd95_thr = max(2.0, ct_max_spacing * 4.0)
+    # 阈值与放疗 bolus 临床精度（±1-2mm 建造深度）对齐：
+    # SBI 后两侧 mesh 是亚体素精度，老的 4mm/8mm（按 2× CT 体素）阈值过于宽松。
+    mhd_thr  = max(0.5, ct_max_spacing * 0.5)
+    hd95_thr = max(1.0, ct_max_spacing * 1.0)
 
     # ── 内部辅助 ──
     def _sample_poly(p, target_spacing):
@@ -1380,11 +1521,56 @@ def execute_validate(config):
     to_log("info", "[3/5] 计算 bolus 体积...")
     _seg = seg_node.GetSegmentation()
     _bolus_seg_id = _seg.GetSegmentIdBySegmentName(bolus_name)
+    _bolus_for_edt = None  # numpy mask，用于直接 EDT 计算最小壳厚（不经过 polydata smooth）
+    _spacing_for_edt = None
     if _bolus_seg_id:
         _arr_b = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, _bolus_seg_id, vols[0]).astype(bool)
         _ct_sx, _ct_sy, _ct_sz = vols[0].GetSpacing()
         vol_B = float(_arr_b.sum()) * _ct_sx * _ct_sy * _ct_sz
         to_log("info", f"  bolus 体积（labelmap）: {vol_B:.0f} mm³")
+
+        # ── 裁切 bbox + padding（SBI 和 fallback 都用，避免对全 CT 体积做 EDT）──
+        if _arr_b.any():
+            _bolus_idx = np.argwhere(_arr_b)
+            _bbox_lo = _bolus_idx.min(axis=0)
+            _bbox_hi = _bolus_idx.max(axis=0) + 1
+            _pad = np.array([
+                int(np.ceil(shell_mm / _ct_sz)) + 2,
+                int(np.ceil(shell_mm / _ct_sy)) + 2,
+                int(np.ceil(shell_mm / _ct_sx)) + 2,
+            ])
+            _crop_lo = np.maximum(_bbox_lo - _pad, 0)
+            _crop_hi = np.minimum(_bbox_hi + _pad, np.array(_arr_b.shape))
+            _arr_b_crop = _arr_b[_crop_lo[0]:_crop_hi[0], _crop_lo[1]:_crop_hi[1], _crop_lo[2]:_crop_hi[2]]
+            _crop_offset = tuple(int(v) for v in _crop_lo)
+
+            # ── SBI 评估：CT 各向异性 + 薄壳时，对 bolus mesh 也做 SBI 重建 ──
+            # 否则 mold 已是高分辨率（_make_female_mold 走 SBI），bolus 仍是体素阶梯，
+            # MHD/HD95 会被分辨率不匹配虚高约 Z_spacing/4。
+            _z_aniso = _ct_sz / max(_ct_sx, _ct_sy)
+            if _z_aniso > 1.5 and shell_mm < _ct_sz * 1.5:
+                from scipy.ndimage import zoom as ndi_zoom
+                # zoom_z 公式必须与 _make_female_mold 保持一致，否则两侧 mesh 分辨率错位
+                _zoom_z = max(int(np.ceil(_z_aniso)),
+                              int(np.ceil(2.0 * _ct_sz / shell_mm)))
+                to_log("info", f"  [评估 SBI] CT Z/XY={_z_aniso:.2f}，对 bolus 也做 SBI 重建（×{_zoom_z}，裁切 {_arr_b_crop.shape}）以匹配模具 mesh 精度")
+                _sdf_b = (distance_transform_edt(~_arr_b_crop, sampling=(_ct_sz, _ct_sy, _ct_sx)) -
+                          distance_transform_edt(_arr_b_crop,  sampling=(_ct_sz, _ct_sy, _ct_sx)))
+                _bolus_hr = ndi_zoom(_sdf_b, (_zoom_z, 1, 1), order=1) <= 0
+                _B_hr = _mask_to_polydata(_bolus_hr, vols[0], zoom_z=_zoom_z, crop_offset_zyx=_crop_offset)
+                _n = vtk.vtkPolyDataNormals()
+                _n.SetInputData(_B_hr)
+                _n.ComputePointNormalsOn(); _n.ComputeCellNormalsOff()
+                _n.SetFeatureAngle(60.0)
+                _n.ConsistencyOn(); _n.AutoOrientNormalsOn(); _n.SplittingOff()
+                _n.Update()
+                B = _n.GetOutput()
+                to_log("info", f"  [评估 SBI] bolus 高分辨率 mesh: {B.GetNumberOfPoints():,} pts (低分辨率原版 已替换)")
+                _bolus_for_edt = _bolus_hr
+                _spacing_for_edt = (_ct_sz / _zoom_z, _ct_sy, _ct_sx)
+            else:
+                _bolus_for_edt = _arr_b_crop
+                _spacing_for_edt = (_ct_sz, _ct_sy, _ct_sx)
     else:
         vol_B = 0.0
         to_log("warning", "  ⚠ 未找到 bolus 段，硅胶用量无法计算")
@@ -1399,11 +1585,19 @@ def execute_validate(config):
     B_loc = _build_locator(B)
     dF_all = _nearest_dist(pF_all, B_loc)
 
-    # 最小壳厚：外表面采样点（距 bolus > 0.6×shell_mm）到 bolus 的最小距离
-    # EDT 生成壳体实际壳厚 ≈ 设定值，0.6×shell_mm 可正确区分内外表面
-    outer_mask = dF_all > shell_mm * 0.6
-    min_shell_mm = float(dF_all[outer_mask].min()) if outer_mask.any() else 0.0
-    MIN_PRINT_THICKNESS_MM = 3.0
+    # 最小壳厚：直接从 EDT 体素计算，绕开 polydata smooth/marching cubes 的几何收缩。
+    # 这是 mold 在 EDT 体素层面的真实最薄壳厚（外侧壳体素到 bolus 表面的最小距离），
+    # 而非通过测量平滑后的 mesh — 后者会被 vtkWindowedSinc 拉近 0.1-0.2mm 导致虚弱化。
+    if _bolus_for_edt is not None:
+        _dist_edt = distance_transform_edt(~_bolus_for_edt, sampling=_spacing_for_edt)
+        # 外侧壳体素：在壳范围内（dist ≤ shell_mm）且距 bolus 表面足够远（> 0.6×shell_mm）
+        _outer_vox = (_dist_edt > shell_mm * 0.6) & (_dist_edt <= shell_mm)
+        min_shell_mm = float(_dist_edt[_outer_vox].min()) if _outer_vox.any() else 0.0
+    else:
+        min_shell_mm = 0.0
+    # 阈值随用户目标壳厚伸缩：允许实际壳厚损失 40%（含 EDT 量化、corner、smooth），
+    # 绝不低于 0.8mm（≈2 层 0.4mm 墙的物理打印底线）
+    MIN_PRINT_THICKNESS_MM = max(0.8, shell_mm * 0.6)
     shell_thick_ok = min_shell_mm >= MIN_PRINT_THICKNESS_MM
 
     inner_mask = dF_all < shell_mm * 0.4   # 收紧到 0.4 倍壁厚，避开侧壁
@@ -1437,7 +1631,7 @@ def execute_validate(config):
         "─" * 52,
         f"{'MHD':<14} {MHD:>9.3f}mm   <{mhd_thr:.2f}mm     {'✓' if MHD < mhd_thr else '✗'}",
         f"{'HD95':<14} {HD95:>9.3f}mm   <{hd95_thr:.2f}mm     {'✓' if HD95 < hd95_thr else '✗'}",
-        f"{'最小壳厚':<14} {min_shell_mm:>9.2f}mm   ≥{MIN_PRINT_THICKNESS_MM:.0f}mm         {'✓' if shell_thick_ok else '✗ 过薄'}",
+        f"{'最小壳厚':<14} {min_shell_mm:>9.2f}mm   ≥{MIN_PRINT_THICKNESS_MM:.2f}mm      {'✓' if shell_thick_ok else '✗ 过薄'}",
         f"{'非流形边':<14} {n_bad_closed:>10d}    =0             {'✓' if geom_ok else '✗'}",
         "─" * 52,
         f"硅胶用量: {silicone_cm3:.1f} cm³ ≈ {silicone_g:.1f} g  |  "
@@ -1459,9 +1653,10 @@ def execute_validate(config):
          f"当前值 {HD95:.3f}mm 超出阈值 {hd95_thr:.2f}mm，存在局部贴合缺陷。\n"
          "  → 检查 bolus 边缘区域（Scissors 裁切边界）是否有毛刺，重新分割后再生成模具。"),
         ("最小壳厚", shell_thick_ok,
-         f"模具最薄处壁厚，需 ≥{MIN_PRINT_THICKNESS_MM:.0f}mm 保证 3D 打印强度。",
-         f"当前最薄处 {min_shell_mm:.2f}mm。\n"
-         f"  → 在第 6 步将壳厚设定值调高至 {max(shell_mm + 1.0, MIN_PRINT_THICKNESS_MM + 0.5):.0f}mm 后重新生成模具。"),
+         f"模具最薄处壁厚（直接从 EDT 体素测量），需 ≥{MIN_PRINT_THICKNESS_MM:.2f}mm（目标壳厚 {shell_mm}mm 的 60%）。",
+         f"当前最薄处 {min_shell_mm:.2f}mm，低于目标壳厚的 60%。\n"
+         f"  → CT 体素 {ct_max_spacing:.2f}mm，体素量化在 corner 处理论极限 ≈ {ct_max_spacing:.1f}mm；"
+         f"建议将壳厚设定 ≥ {max(ct_max_spacing * 1.5, shell_mm + 0.4):.1f}mm 后重新生成模具。"),
         ("非流形边", geom_ok,
          "封闭壳网格是否为封闭流形（设计中的 sprue/vent/开顶切口已用 Closed 排除）。",
          f"封闭壳发现 {n_bad_closed} 条非流形/开放边，几何生成阶段已出现破坏。\n"
