@@ -36,22 +36,28 @@
 ### 模具生成
 - **VTK 布尔崩溃**：`expanded - bolus = 0 pts`（重合面），`skin ∪ base = 0 pts`（无交集）
 - **修复**：阴模用 Segment Editor 标记图 COPY+SUBTRACT；阳模用 vtkAppendPolyData
-- **壳厚下限**：CT Z=3mm 间距，最小壳厚 ≥4mm（前端限到 4-10mm）
+- **壳厚下限**：前端 slider 最小值 3mm（EDT 精确生成，无 Margin 量化损失）
+
+### 模具生成（2026-05-15 重构）
+- **Bolus_Expanded 改 EDT**：原 Slicer Margin effect 量化误差导致实际壳厚 = 设定值 × 50-80%；改用 `scipy.ndimage.distance_transform_edt` 直接在 numpy 层计算精确壳体 `(0 < dist ≤ shell_mm)`，跳过 Bolus_Expanded 中间段和 Editor Widget，一次写入 Mold_Female labelmap。实际壳厚 ≈ 设定值，无量化损失。
+- **顶板开口修复**：原 per-column bolus 极值切割导致曲面 bolus 侧壁被削；改为沿选定轴取 mold 全局最外侧 `⌈shell_mm/spacing⌉` 层体素移除，侧壁保持完整。执行前 log 6 个解剖方向（S/I/A/P/L/R）顶板面积供选择参考。
 
 ### 适形度验证（2026-05-12）
-- **Dice/体积比误判根因**：`vtkPolyDataToImageStencil` 对空心壳网格用奇偶射线规则，射线穿外壁再穿内壁 = 偶数交叉 = "外部"，导致 `vF` 全空 → `vCavity = vExpanded`（实为 bolus + 壳料体积）→ 体积比 3.14、Dice 0.48
-- **修复**：用 EDT 距离场直接定义壳料体素（`dist_outside_B ∈ (0, shell_mm]`），绕开空心网格体素化问题；`vCavity = vB`，体积比/Dice → 1.0
-- **mold∩skin 删除**：bolus 贴皮肤界面必然有重叠，该指标永远误报且信息冗余（MHD/HD95 已验证贴合），已移除
-- **新增指标**：最小壳厚（外表面采样点到 bolus 最小距离，≥3mm 才可打印）；硅胶用量（bolus 体积 × 1.1 g/cm³，仅报告）；模具尺寸（超 256mm 给出警告）
-- **指标说明**：每次验证结束输出各指标含义；不通过时给出具体原因和修复建议
-- **去除测试模式**：删除 `?dev` URL 参数及所有关联逻辑（连接检查绕过、步骤自由跳转、DEV MODE 横幅）
-- **删除长方体测试体模**：移除 `execute_load_box_phantom`、`/api/test/box_phantom` 路由、`test_phantom.py` 及前端两处测试按钮
+- **Dice/体积比移除**：空心薄壁网格（EDT 生成 2-voxel 厚）无法被 `vtkPolyDataToImageStencil`（奇偶失效）或 `vtkSelectEnclosedPoints`（返回整个内腔）可靠体素化；移除 Dice 和体积比，不参与 PASS/FAIL。
+- **现行 PASS/FAIL 指标（4 项）**：MHD（内表面贴合距离）、HD95（95% 分位贴合）、最小壳厚（≥3mm）、非流形边（=0）。MHD/HD95 同时承担"模具是否匹配当前 bolus"的检测职责。
+- **最小壳厚滤波器修复**：原 `0.6×shell_mm` 相对阈值在壳设定较大时会把真实薄点误判为内表面剔除；改为绝对阈值 1.5mm，真实最小值可正常暴露。
+- **fix_hints**：后端验证结果新增 `fix_hints` dict，失败指标的修改建议随 JSON 返回前端，在 ValidatePanel 展示"修改建议"区块。
+- **mold∩skin 删除**：bolus 贴皮肤界面必然有重叠，该指标永远误报且信息冗余（MHD/HD95 已验证贴合），已移除。
+- **新增指标**：最小壳厚（外表面采样点到 bolus 最小距离，≥3mm 才可打印）；硅胶用量（bolus 体积 × 1.1 g/cm³，仅报告）；模具尺寸（超 256mm 给出警告）。
+- **去除测试模式**：删除 `?dev` URL 参数及所有关联逻辑（连接检查绕过、步骤自由跳转、DEV MODE 横幅）。
+- **删除长方体测试体模**：移除 `execute_load_box_phantom`、`/api/test/box_phantom` 路由、`test_phantom.py` 及前端两处测试按钮。
 
 ### 前端
 - 三态连接检测：online / no_watcher / offline
 - QuickJump 横幅：检测已完成步骤，一键跳转
 - Vite 中间件 pkill + 重启 Slicer
 - SVG 矢量图标替换 emoji
+- ValidatePanel：Dice/体积比列移除，新增最小壳厚列和修改建议区块；硅胶用量/模具尺寸展示
 
 ### 其他
 - `_safe_get_effect()` 空指针保护
@@ -62,7 +68,7 @@
 
 ## 当前待验证
 
-- **4mm 壳厚模具**：体素连续性（Z 向 1.3 体素，勉强）
+- **EDT 壳体端到端**：重新生成模具后适形度评估是否全 PASS（MHD/HD95/最小壳厚/非流形边）
 - **实际打印**：Bambu Studio 墙层数 ≥5，防硅胶泄漏
 - **Hollow 抽壳法 vs 偏移相减法**：实际效果对比
 
@@ -86,10 +92,9 @@ cd frontend && npx vite --host 0.0.0.0
 ### 功能
 - **`hollow` 方法未验证**：代码存在于 `execute_pipeline`，但从未端到端运行过。UI 上可选，实际效果不明。需在 Slicer 中手动验证后更新 README。
 
-### 模具生成（2026-05-12 深审遗留风险）
-- **Margin 体素化精度损失**：Slicer Margin 效果按体素膨胀，4mm shell 在 3mm CT 体素上只膨胀 1 体素 ≈ 3mm，实际壳厚比设定值少 ~25%。需在 Slicer 中实测后决定是否补偿（如设 5mm 输入换 4mm 实际厚度）。
+### 模具生成（遗留风险）
 - **单片封闭模具无脱模设计**：模具仅一个 sprue 孔，硅胶硬化后取不出 bolus。当前用法假设：① 柔性 TPU 打印后撕开，② 一次性切开。若临床要重复使用，需要加分模面或两瓣式设计。
-- **底板与皮肤段重叠**：`expanded - bolus` 让模具底板深入 skin 体素空间 shell_mm 深度。浇铸场景无影响（mold 离体使用）；若要把 mold 直接戴在患者身上做治疗，底板会和皮肤冲突。需明确临床流程。
+- **底板与皮肤段重叠**：底板深入 skin 体素空间 shell_mm 深度。浇铸场景无影响（mold 离体使用）；若 mold 直接戴在患者身上治疗，底板会和皮肤冲突。需明确临床流程。
 - **方向假设 Z 朝上**：sprue 与 vent 默认沿 Z 轴穿透模具中心。头顶 bolus 正确；侧脸/腹部 bolus 方向错误，sprue 不在重力上方，硅胶会从错误位置溢出。需根据 bolus 法线方向自适应或加用户朝向控制。
 
 ### 工程质量

@@ -765,23 +765,117 @@ def _add_model_to_scene(poly, name, color=(0.8, 0.5, 0.3), opacity=0.7):
     return node
 
 
-def _strip_top_plate(seg_node, bolus_id, female_id, ref_volume, skin_id=None):
-    """在 labelmap 空间沿 bolus outward 方向移除模具顶板，生成顶开式模具。
+def _anatomical_dir_to_axis_sign(ref_volume, label):
+    """Convert anatomical label (S/I/A/P/L/R) to (numpy_axis, sign).
 
-    Outward 方向自动检测：
-      - 轴：bolus 最小 bbox 维度（薄壳几何下 = 厚度方向 = outward 方向）
-      - 符号：bolus 质心 vs skin 质心沿此轴的位置，bolus 偏哪边即外向哪边
+    Numpy labelmap axis order: (K=0, J=1, I=2). Each corresponds to IJK
+    columns (2, 1, 0) of the IJK→RAS matrix.
+    """
+    import vtk
+    ras_dirs = {
+        'R': (0,  1), 'L': (0, -1),
+        'A': (1,  1), 'P': (1, -1),
+        'S': (2,  1), 'I': (2, -1),
+    }
+    ras_component, ras_polarity = ras_dirs[label.upper()]
 
-    检测结果：
-      - 头顶 bolus → +Z（Z 是最小维度，bolus 在 skin 上方）
-      - 胸壁 bolus → +Y（Y 是最小维度，bolus 在 skin 前方）
-      - 侧脸 bolus → ±X
-      - 斜面 → 最强分量轴
+    mat = vtk.vtkMatrix4x4()
+    ref_volume.GetIJKToRASMatrix(mat)
 
-    对每个垂直 outward 轴的 (a, b) 列，找到 bolus 沿 outward 轴的极值，
-    移除模具中超出此极值的体素。bolus 范围外的列不动，保留侧壁完整。
+    # numpy_axis → IJK column index
+    numpy_to_ijk_col = [2, 1, 0]
 
-    返回方向标签（如 "+Y"）供日志和前端展示。
+    best_axis, best_sign, best_abs = 0, 1, -1.0
+    for na in range(3):
+        col = numpy_to_ijk_col[na]
+        col_vec = [mat.GetElement(r, col) for r in range(3)]
+        col_len = sum(v * v for v in col_vec) ** 0.5
+        if col_len < 1e-6:
+            continue
+        component = col_vec[ras_component] / col_len
+        if abs(component) > best_abs:
+            best_abs = abs(component)
+            best_axis = na
+            best_sign = 1 if component * ras_polarity > 0 else -1
+
+    return best_axis, best_sign
+
+
+def _outward_direction_from_nearest_skin(bolus_coords, nearest_skin_coords, spacing_zyx):
+    """Return (axis, sign, extents_mm, mean_offsets_mm) from local skin→bolus offsets.
+
+    Axis order follows Slicer numpy labelmaps: z=0, y=1, x=2.
+    """
+    spacing = [float(v) for v in spacing_zyx]
+    mins = [None, None, None]
+    maxs = [None, None, None]
+    sums = [0.0, 0.0, 0.0]
+    count = 0
+
+    for bolus_pt, skin_pt in zip(bolus_coords, nearest_skin_coords):
+        count += 1
+        for ax in range(3):
+            b = float(bolus_pt[ax])
+            s = float(skin_pt[ax])
+            mins[ax] = b if mins[ax] is None else min(mins[ax], b)
+            maxs[ax] = b if maxs[ax] is None else max(maxs[ax], b)
+            sums[ax] += (b - s) * spacing[ax]
+
+    if count == 0:
+        raise ValueError("bolus_coords is empty")
+
+    extents_mm = [(maxs[ax] - mins[ax] + 1.0) * spacing[ax] for ax in range(3)]
+    mean_offsets_mm = [sums[ax] / count for ax in range(3)]
+    axis = max(range(3), key=lambda ax: abs(mean_offsets_mm[ax]))
+    sign = +1 if mean_offsets_mm[axis] >= 0 else -1
+    return axis, sign, extents_mm, mean_offsets_mm
+
+
+def _detect_bolus_outward_direction(bolus_arr, skin_arr, spacing_zyx):
+    """Detect local outward direction for mold opening/base-plate placement."""
+    import numpy as np
+
+    bolus_coords = np.argwhere(bolus_arr)   # (N, 3) column order z, y, x
+    if bolus_coords.size == 0:
+        raise ValueError("bolus labelmap is empty")
+
+    if skin_arr is not None and skin_arr.any():
+        from scipy.ndimage import distance_transform_edt
+
+        # For each bolus voxel, find its nearest skin voxel. The mean local
+        # skin→bolus vector is a better outward proxy than bbox thickness:
+        # thin bolus patches have their smallest bbox axis perpendicular to the
+        # largest face, which can put the opening on the mold's largest side.
+        _, nearest = distance_transform_edt(
+            ~skin_arr, sampling=spacing_zyx, return_indices=True
+        )
+        bolus_index = tuple(bolus_coords[:, ax] for ax in range(3))
+        nearest_skin_coords = np.column_stack([
+            nearest[ax][bolus_index] for ax in range(3)
+        ])
+        axis, sign, extents_mm, mean_offsets_mm = _outward_direction_from_nearest_skin(
+            bolus_coords, nearest_skin_coords, spacing_zyx
+        )
+        return axis, sign, extents_mm, mean_offsets_mm, "nearest-skin"
+
+    extents_mm = np.array([
+        (bolus_coords[:, ax].max() - bolus_coords[:, ax].min() + 1) * spacing_zyx[ax]
+        for ax in range(3)
+    ])
+    axis = int(np.argmin(extents_mm))
+    return axis, +1, extents_mm.tolist(), [0.0, 0.0, 0.0], "bbox-fallback"
+
+
+def _strip_top_plate(seg_node, bolus_id, female_id, ref_volume, shell_mm, skin_id=None, opening_dir=None):
+    """在 labelmap 空间沿指定方向移除模具顶板，生成顶开式模具。
+
+    顶板定义：mold 在该方向上全局最外侧 shell_mm 厚的体素层。
+    移除该层使内腔从选定方向敞开，侧壁不受影响。
+
+    opening_dir: 解剖方向标签 S/I/A/P/L/R（优先），None 时自动检测（bolus 最近 skin 法向）。
+
+    执行前先计算并 log 6 个解剖面的面积（cm²），辅助方向选择。
+    返回方向标签（如 "+Z(S)"）供日志和前端展示。
     """
     import numpy as np
     bolus_arr = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, bolus_id, ref_volume).astype(bool)
@@ -790,69 +884,77 @@ def _strip_top_plate(seg_node, bolus_id, female_id, ref_volume, skin_id=None):
     if not bolus_arr.any():
         to_log("warning", "  ⚠ bolus labelmap 为空，跳过开顶")
         return None
+    if not mold_arr.any():
+        to_log("warning", "  ⚠ mold labelmap 为空，跳过开顶")
+        return None
 
     # GetSpacing 返回 (sx, sy, sz)；numpy axis 顺序为 (z, y, x)
     sx, sy, sz = ref_volume.GetSpacing()
     spacing_zyx = np.array([sz, sy, sx])
     axis_labels = ["Z", "Y", "X"]
+    shape = mold_arr.shape
 
-    # ── 自动检测 outward 方向 ──
-    bolus_coords = np.argwhere(bolus_arr)   # (N, 3) 列序 z, y, x
-    extents_mm = np.array([
-        (bolus_coords[:, ax].max() - bolus_coords[:, ax].min() + 1) * spacing_zyx[ax]
-        for ax in range(3)
-    ])
-    outward_axis = int(np.argmin(extents_mm))   # 最小维度 = 厚度方向 = outward 轴
+    # 各轴的面元面积（垂直该轴的两轴间距之积）
+    face_voxel_area = [
+        spacing_zyx[1] * spacing_zyx[2],  # Z 轴面: dy*dx
+        spacing_zyx[0] * spacing_zyx[2],  # Y 轴面: dz*dx
+        spacing_zyx[0] * spacing_zyx[1],  # X 轴面: dz*dy
+    ]
 
-    # 符号：bolus 质心相对 skin 质心沿此轴的位置
-    b_along = float(bolus_coords[:, outward_axis].mean())
-    s_along = None
+    # ── 计算并 log 6 个解剖面的面积，帮助用户选方向 ──
+    anat_dirs = [("S", "头顶"), ("I", "足底"), ("A", "前方"), ("P", "后方"), ("L", "左"), ("R", "右")]
+    to_log("info", f"  [面积预览] 各方向顶板面积（{shell_mm}mm 厚）：")
+    for ad, label in anat_dirs:
+        ax, sgn = _anatomical_dir_to_axis_sign(ref_volume, ad)
+        n_sl = max(1, int(np.ceil(shell_mm / spacing_zyx[ax])))
+        idx_g = np.arange(shape[ax]).reshape([shape[ax] if i == ax else 1 for i in range(3)])
+        if sgn > 0:
+            ext = int(np.where(mold_arr, idx_g, -1).max())
+            face = mold_arr & (idx_g >= ext - n_sl + 1)
+        else:
+            ext = int(np.where(mold_arr, idx_g, shape[ax]).min())
+            face = mold_arr & (idx_g <= ext + n_sl - 1)
+        area_cm2 = int(face.sum()) * face_voxel_area[ax] / 100.0
+        to_log("info", f"    {label}({ad}): {area_cm2:.1f} cm²")
+
+    # ── 确定开口方向 ──
+    skin_arr = None
     if skin_id:
         skin_arr = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, skin_id, ref_volume).astype(bool)
-        if skin_arr.any():
-            s_along = float(np.argwhere(skin_arr)[:, outward_axis].mean())
-    if s_along is None:
-        to_log("warning", "  ⚠ skin 段不可用，outward 符号默认取 +")
-        outward_sign = +1
-    else:
-        outward_sign = +1 if b_along > s_along else -1
+    outward_axis, outward_sign, extents_mm, mean_offsets_mm, method = _detect_bolus_outward_direction(
+        bolus_arr, skin_arr, spacing_zyx
+    )
+
+    if opening_dir and opening_dir.upper() in ("S", "I", "A", "P", "L", "R"):
+        outward_axis, outward_sign = _anatomical_dir_to_axis_sign(ref_volume, opening_dir)
+        method = f"anatomical-{opening_dir.upper()}"
 
     dir_label = f"{'+' if outward_sign > 0 else '-'}{axis_labels[outward_axis]}"
     to_log("info",
-           f"  [开顶] 自动检测 outward 方向: {dir_label} "
-           f"(厚度 {extents_mm[outward_axis]:.1f}mm；其余维度 "
-           f"{', '.join(f'{axis_labels[a]}={extents_mm[a]:.0f}mm' for a in range(3) if a != outward_axis)})")
+           f"  [开顶] 开口方向: {dir_label} ({method})")
 
-    # ── 沿 outward 轴扫顶 ──
-    shape = bolus_arr.shape
+    # ── 移除顶板：mold 在该方向上全局最外侧 n_slices 层 ──
+    n_slices = max(1, int(np.ceil(shell_mm / spacing_zyx[outward_axis])))
     idx_range = np.arange(shape[outward_axis], dtype=np.int32)
-    idx_shape = [1, 1, 1]
-    idx_shape[outward_axis] = shape[outward_axis]
-    idx_grid = idx_range.reshape(idx_shape)
+    idx_grid = idx_range.reshape([shape[outward_axis] if i == outward_axis else 1 for i in range(3)])
 
     if outward_sign > 0:
-        # outward 朝 +：找 bolus 在此轴上的最大索引，移除其外侧
-        bolus_extreme = np.where(bolus_arr, idx_grid, -1).max(axis=outward_axis, keepdims=True)
-        to_remove = idx_grid > bolus_extreme
+        mold_extreme = int(np.where(mold_arr, idx_grid, -1).max())
+        to_remove = mold_arr & (idx_grid >= mold_extreme - n_slices + 1)
     else:
-        # outward 朝 -：找最小索引，移除其外侧
-        sentinel = shape[outward_axis]
-        bolus_extreme = np.where(bolus_arr, idx_grid, sentinel).min(axis=outward_axis, keepdims=True)
-        to_remove = idx_grid < bolus_extreme
-
-    has_bolus = bolus_arr.any(axis=outward_axis, keepdims=True)
-    to_remove = to_remove & has_bolus
+        mold_extreme = int(np.where(mold_arr, idx_grid, shape[outward_axis]).min())
+        to_remove = mold_arr & (idx_grid <= mold_extreme + n_slices - 1)
 
     mold_open = mold_arr & ~to_remove
-    removed = int((mold_arr & ~mold_open).sum())
+    removed = int(to_remove.sum())
     slicer.util.updateSegmentBinaryLabelmapFromArray(
         mold_open.astype(np.uint8), seg_node, female_id, ref_volume
     )
-    to_log("info", f"  [开顶] 沿 {dir_label} 移除顶板 {removed} 体素")
+    to_log("info", f"  [开顶] 沿 {dir_label} 移除顶板 {removed} 体素（{n_slices} 层 ≈ {shell_mm}mm）")
     return dir_label
 
 
-def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm, open_top=False):
+def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm, open_top=False, opening_dir=None):
     """阴模：bolus 外扩 shell_mm 后掏除 bolus，得到封闭空心壳。
 
     返回 (closed_poly, final_poly, open_top_direction)：
@@ -867,46 +969,35 @@ def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm, open_top=False)
     外壳底面深入 skin shell_mm（壳壁厚度），是浇铸模具的正常底板厚度。
     """
     to_log("info", f"── 阴模生成（{'顶开式' if open_top else '封闭式'}）──")
+    import numpy as np
+    from scipy.ndimage import distance_transform_edt
     seg = seg_node.GetSegmentation()
 
-    _apply_margin_to_segment(seg_node, bolus_name, shell_mm, SEG["temp_bolus_expanded"])
+    bolus_id = seg.GetSegmentIdBySegmentName(bolus_name)
+    if not bolus_id:
+        raise RuntimeError(f"未找到 {bolus_name} 段，无法生成模具")
 
-    expanded_id = seg.GetSegmentIdBySegmentName(SEG["temp_bolus_expanded"])
-    bolus_id    = seg.GetSegmentIdBySegmentName(bolus_name)
+    ref_volume = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
+    if ref_volume is None:
+        raise RuntimeError("场景中无体积数据，无法计算 EDT 壳体")
+
+    # 全 numpy 一次性计算阴模壳体：dist > 0（bolus 外侧）且 dist ≤ shell_mm（壳厚以内）
+    # 直接产出最终 Mold_Female labelmap，跳过 Bolus_Expanded 中间段，避免 Editor Widget
+    # 与 numpy 写入两套 labelmap geometry 不一致导致的 SUBTRACT 边界裁切问题。
+    arr_b = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, bolus_id, ref_volume).astype(bool)
+    sx, sy, sz = ref_volume.GetSpacing()
+    dist = distance_transform_edt(~arr_b, sampling=(sz, sy, sx))
+    arr_mold = ((dist > 0) & (dist <= shell_mm)).astype(np.uint8)
+    to_log("info", f"  [EDT 壳体] 精确 {shell_mm}mm，{int(arr_mold.sum())} 体素")
 
     female_name = "Mold_Female"
     old_female = seg.GetSegmentIdBySegmentName(female_name)
     if old_female:
         seg.RemoveSegment(old_female)
-    female_id   = seg.AddEmptySegment(female_name, female_name)
-    ref_volume  = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
-
-    en = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentEditorNode")
-    en.SetOverwriteMode(slicer.vtkMRMLSegmentEditorNode.OverwriteNone)
-    ew = slicer.qMRMLSegmentEditorWidget()
-    ew.setMRMLScene(slicer.mrmlScene)
-    ew.setMRMLSegmentEditorNode(en)
-    ew.setSegmentationNode(seg_node)
-    ew.setSourceVolumeNode(ref_volume)
-    en.SetSelectedSegmentID(female_id)
+    female_id = seg.AddEmptySegment(female_name, female_name)
     seg.CreateRepresentation(slicer.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName())
-
-    try:
-        eff = _safe_get_effect(ew, "Logical operators")
-        eff.setParameter("Operation", "COPY")
-        eff.setParameter("ModifierSegmentID", expanded_id)
-        eff.self().onApply()
-        to_log("info", f"  [复制] Bolus_Expanded → {female_name}")
-
-        eff = _safe_get_effect(ew, "Logical operators")
-        eff.setParameter("Operation", "SUBTRACT")
-        eff.setParameter("ModifierSegmentID", bolus_id)
-        eff.self().onApply()
-        to_log("info", f"  [掏空] 减去 bolus → {shell_mm}mm 封闭壳体")
-    finally:
-        ew.setActiveEffectByName("")
-        ew.setMRMLScene(None)
-        slicer.mrmlScene.RemoveNode(en)
+    slicer.util.updateSegmentBinaryLabelmapFromArray(arr_mold, seg_node, female_id, ref_volume)
+    to_log("info", f"  [写入] {female_name}（壳厚 {shell_mm}mm）")
 
     def _extract_and_normalize():
         """从 female_name 当前 labelmap 提取 polydata 并修正法线一致性。
@@ -945,7 +1036,7 @@ def _make_female_mold(seg_node, bolus_name, skin_name, shell_mm, open_top=False)
     if open_top:
         # 在 labelmap 空间剥顶后再次提取，闭合壳 polydata 已抓住，不受影响
         skin_id = seg.GetSegmentIdBySegmentName(skin_name) if skin_name else None
-        open_top_direction = _strip_top_plate(seg_node, bolus_id, female_id, ref_volume, skin_id=skin_id)
+        open_top_direction = _strip_top_plate(seg_node, bolus_id, female_id, ref_volume, shell_mm, skin_id=skin_id, opening_dir=opening_dir)
         final_poly = _extract_and_normalize()
         fe1 = vtk.vtkFeatureEdges()
         fe1.SetInputData(final_poly)
@@ -1068,7 +1159,7 @@ def _add_sprue_and_vents(female_poly, sprue_radius_mm, vent_radius_mm, shell_mm,
 def _add_base_plate(female_poly, bolus_id, seg_node, ref_volume, plate_mm=1.0):
     """在阴模底部（anti-outward方向）添加 plate_mm 厚平板，围绕 bolus 最小投影范围。
 
-    outward 方向检测逻辑与 _strip_top_plate 保持一致（最小维度 = 厚度方向 = outward 轴）。
+    outward 方向检测逻辑与 _strip_top_plate 保持一致。
     底板在 anti-outward 端，与顶开式开口和 sprue/vent 均处于对侧，不产生冲突。
     """
     import numpy as np
@@ -1082,21 +1173,13 @@ def _add_base_plate(female_poly, bolus_id, seg_node, ref_volume, plate_mm=1.0):
     spacing_zyx = np.array([sz, sy, sx])
     axis_labels = ["Z", "Y", "X"]
 
-    bolus_coords = np.argwhere(bolus_arr)
-    extents_mm = np.array([
-        (bolus_coords[:, ax].max() - bolus_coords[:, ax].min() + 1) * spacing_zyx[ax]
-        for ax in range(3)
-    ])
-    outward_axis = int(np.argmin(extents_mm))  # numpy 轴序 z=0, y=1, x=2
-
-    b_along = float(bolus_coords[:, outward_axis].mean())
-    outward_sign = +1
+    skin_arr = None
     skin_id = seg_node.GetSegmentation().GetSegmentIdBySegmentName(SEG["skin"])
     if skin_id:
         skin_arr = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, skin_id, ref_volume).astype(bool)
-        if skin_arr.any():
-            s_along = float(np.argwhere(skin_arr)[:, outward_axis].mean())
-            outward_sign = +1 if b_along > s_along else -1
+    outward_axis, outward_sign, _, _, _ = _detect_bolus_outward_direction(
+        bolus_arr, skin_arr, spacing_zyx
+    )
 
     # vtk bounds [xmin,xmax,ymin,ymax,zmin,zmax]; numpy z=0→vtk(4,5); y=1→(2,3); x=2→(0,1)
     _vtk_lo = {0: 4, 1: 2, 2: 0}
@@ -1153,7 +1236,8 @@ def execute_mold(config):
     shell_mm = d.get("mold_shell_thickness_mm", 4.0)
     sprue_r  = d.get("mold_sprue_radius_mm", 3.0)
     vent_r   = d.get("mold_vent_radius_mm", 1.0)
-    mold_type = d.get("mold_type", "closed")  # "closed" | "open_top"
+    mold_type = d.get("mold_type", "closed")   # "closed" | "open_top"
+    opening_dir = d.get("opening_dir", None)   # S/I/A/P/L/R 或 None（自动）
 
     # 清理上一次生成的同名节点（含 Mold_Female_Closed 和 Mold_Female_Conformal），
     # 避免重复生成时累积 _1/_2 后缀导致导出/validate 错乱
@@ -1165,6 +1249,7 @@ def execute_mold(config):
         closed, female, open_top_direction = _make_female_mold(
             seg_node, bolus_name, SEG["skin"], shell_mm,
             open_top=(mold_type == "open_top"),
+            opening_dir=opening_dir,
         )
 
         # 纯封闭壳作为 validate 的体素化基准（隐藏，避免干扰用户视图）
@@ -1213,16 +1298,14 @@ def execute_mold(config):
 def execute_validate(config):
     """适形度评估: 比较 bolus 与「阴模内腔」并检查模具几何健康度
 
-    指标:
-      M1 MHD       bolus ↔ 阴模内表面双向平均距离
-      M2 HD95      bolus ↔ 阴模内表面双向 95% 分位距离
-      M3 Dice      bolus 体素 vs 反演内腔体素
-      M4 体积比    V_cavity / V_bolus
-      M5 最小壳厚  外表面最近点到 bolus 距离，≥3mm 才可靠打印
-      M6 非流形边  模具拓扑必须封闭流形 (3D 打印前提)
+    PASS/FAIL 指标:
+      M1 MHD      bolus ↔ 阴模内表面双向平均距离，检测模具是否匹配当前 bolus
+      M2 HD95     bolus ↔ 阴模内表面双向 95% 分位距离，检测局部贴合最差区域
+      M3 最小壳厚 外表面采样点到 bolus 最小距离，≥3mm 保证 3D 打印强度
+      M4 非流形边 模具拓扑必须封闭流形（3D 打印前提）
     附加信息 (不影响 PASS/FAIL):
-      I1 硅胶用量  bolus 体积 × 1.1 g/cm³
-      I2 模具尺寸  X/Y/Z mm，超 256mm 给出警告
+      I1 硅胶用量 bolus 体积 × 1.1 g/cm³
+      I2 模具尺寸 X/Y/Z mm，超 256mm 给出警告
 
     阈值随上游 CT 体素分辨率自适应，避免对超出输入精度的指标做硬要求
     """
@@ -1385,45 +1468,12 @@ def execute_validate(config):
     )
     vB = _voxelize_3d(B, _sp, _origin, _dims)
 
-    # ── 从纯封闭壳 Mold_Female_Closed 体素化壳料 ──
-    # 体素化必须用封闭网格才能精确（vtkPolyDataToImageStencil 扫描线依赖闭合内外判定）。
-    # execute_mold 已保存制造改造前的封闭版本到 Mold_Female_Closed；此处优先取它。
-    # 若节点不存在（旧场景未重新生成模具），回退到对 F 做 FillHoles 虚拟封闭。
-    closed_node = slicer.mrmlScene.GetFirstNodeByName("Mold_Female_Closed")
-    if closed_node and closed_node.GetPolyData() and closed_node.GetPolyData().GetNumberOfPoints() > 0:
-        F_for_voxel = closed_node.GetPolyData()
-        to_log("info", "  体素化基准: Mold_Female_Closed（开口/sprue/底板之前的封闭壳）")
-    else:
-        to_log("warning", "  ⚠ 未找到 Mold_Female_Closed（场景较旧），用 vtkFillHolesFilter 兜底封闭 F")
-        _fill = vtk.vtkFillHolesFilter()
-        _fill.SetInputData(F)
-        _fill.SetHoleSize(1e6)
-        _fill.Update()
-        _tri = vtk.vtkTriangleFilter()
-        _tri.SetInputData(_fill.GetOutput())
-        _tri.Update()
-        _norm = vtk.vtkPolyDataNormals()
-        _norm.SetInputData(_tri.GetOutput())
-        _norm.ConsistencyOn()
-        _norm.SplittingOff()
-        _norm.Update()
-        F_for_voxel = _norm.GetOutput()
-
-    vF = _voxelize_3d(F_for_voxel, _sp, _origin, _dims)
-    if not vF.any():
-        # 罕见：PolyDataToImageStencil 对此网格失败（如严重翻面/退化三角面），回退更稳健的方法
-        to_log("warning", "  ⚠ PolyDataToImageStencil 体素化全空，回退 vtkSelectEnclosedPoints")
-        vF = _vox_enclosed(F_for_voxel, _sp, _origin, _dims)
-    to_log("info", f"  实际模具壳料: {vF.sum() * _sp**3:.0f} mm³")
-
-    # 理论外包络（仅用于定义"应该是模具占据的区域"参照系）
-    dist_outside_B = distance_transform_edt(~vB, sampling=_sp)
-    vExpanded = dist_outside_B <= shell_mm
-
-    # vCavity = 理论外包络中减去实际壳料：
-    # · 模具几何良好 → vF ≈ 预期壳料 → vCavity ≈ vB → Dice ≈ 1
-    # · 模具腔体偏离 bolus（缺料/穿料/位移） → vF 与预期错位 → vCavity 与 vB Dice < 1
-    vCavity = vExpanded & ~vF
+    # EDT 直接计算理论壳料，跳过空心薄壁网格的体素化。
+    # PolyDataToImageStencil 奇偶规则和 vtkSelectEnclosedPoints 均无法可靠处理
+    # EDT 生成的 2-voxel 厚空心壳网格；几何一致性由 MHD/HD95（表面采样）保证。
+    dist_outside_B = distance_transform_edt(~vB, sampling=(_sp, _sp, _sp))
+    vF_ideal = (dist_outside_B > 0) & (dist_outside_B <= shell_mm)
+    to_log("info", f"  理论壳料体积: {vF_ideal.sum() * _sp**3:.0f} mm³（EDT {shell_mm}mm）")
 
     # ── 自适应密度采样 + 内表面过滤 ──
     to_log("info", "[4/5] 表面采样 (自适应密度)...")
@@ -1435,8 +1485,10 @@ def execute_validate(config):
     B_loc = _build_locator(B)
     dF_all = _nearest_dist(pF_all, B_loc)
 
-    # 最小壳厚：外表面采样点（距 bolus > 0.6×shell_mm）到 bolus 的最小距离
-    outer_mask = dF_all > shell_mm * 0.6
+    # 最小壳厚：外表面采样点（距 bolus > 1.5mm 绝对值）到 bolus 的最小距离
+    # 用绝对阈值避免"shell_mm 设大 → 阈值跟着上抬 → 真实薄点被当作内表面剔除"的误判
+    OUTER_THRESHOLD_MM = 1.5
+    outer_mask = dF_all > OUTER_THRESHOLD_MM
     min_shell_mm = float(dF_all[outer_mask].min()) if outer_mask.any() else 0.0
     MIN_PRINT_THICKNESS_MM = 3.0
     shell_thick_ok = min_shell_mm >= MIN_PRINT_THICKNESS_MM
@@ -1449,18 +1501,13 @@ def execute_validate(config):
     to_log("info", f"  采样: B={len(pB)}, F全表面={len(pF_all)} → 内表面={len(pF)} (间距 {target_spacing:.1f}mm)")
 
     # ── 计算指标 ──
-    to_log("info", "[5/5] 计算 MHD / HD95 / Dice / 体积比 / 壳厚...")
+    to_log("info", "[5/5] 计算 MHD / HD95 / 壳厚...")
     dBF = _nearest_dist(pB, F_loc)
     MHD = max(dBF.mean(), dFB.mean())
     HD95 = max(np.percentile(dBF, 95), np.percentile(dFB, 95))
 
-    denom = vB.sum() + vCavity.sum()
-    Dice = 2 * (vB & vCavity).sum() / denom if denom > 0 else 0.0
-
     vox_unit = _sp ** 3
     vol_B = vB.sum() * vox_unit
-    vol_cavity = vCavity.sum() * vox_unit
-    Ratio = vol_cavity / vol_B if vol_B > 0 else 0.0
 
     silicone_cm3 = round(vol_B / 1000.0, 1)
     silicone_g   = round(silicone_cm3 * 1.1, 1)
@@ -1471,8 +1518,6 @@ def execute_validate(config):
     ok = all([
         MHD < mhd_thr,
         HD95 < hd95_thr,
-        Dice > 0.95,
-        0.95 < Ratio < 1.05,
         shell_thick_ok,
         geom_ok,
     ])
@@ -1482,8 +1527,6 @@ def execute_validate(config):
         "─" * 52,
         f"{'MHD':<14} {MHD:>9.3f}mm   <{mhd_thr:.2f}mm     {'✓' if MHD < mhd_thr else '✗'}",
         f"{'HD95':<14} {HD95:>9.3f}mm   <{hd95_thr:.2f}mm     {'✓' if HD95 < hd95_thr else '✗'}",
-        f"{'Dice':<14} {Dice:>10.4f}   >0.95          {'✓' if Dice > 0.95 else '✗'}",
-        f"{'体积比':<14} {Ratio:>10.4f}   0.95~1.05      {'✓' if 0.95 < Ratio < 1.05 else '✗'}",
         f"{'最小壳厚':<14} {min_shell_mm:>9.2f}mm   ≥{MIN_PRINT_THICKNESS_MM:.0f}mm         {'✓' if shell_thick_ok else '✗ 过薄'}",
         f"{'非流形边':<14} {n_bad_closed:>10d}    =0             {'✓' if geom_ok else '✗'}",
         "─" * 52,
@@ -1505,30 +1548,28 @@ def execute_validate(config):
          "bolus 与模具内表面距离的 95% 分位值，反映最差 5% 区域的贴合误差。",
          f"当前值 {HD95:.3f}mm 超出阈值 {hd95_thr:.2f}mm，存在局部贴合缺陷。\n"
          "  → 检查 bolus 边缘区域（Scissors 裁切边界）是否有毛刺，重新分割后再生成模具。"),
-        ("Dice",  Dice > 0.95,
-         "bolus 体积与模具内腔体积的重叠度（1.0 = 完全一致）。",
-         f"当前值 {Dice:.4f}，模具内腔与 bolus 体积不匹配。\n"
-         "  → 确认模具是从当前 bolus 生成的；若 bolus 已重新执行，需重新生成模具。"),
-        ("体积比", 0.95 < Ratio < 1.05,
-         "模具内腔体积 / bolus 体积，应接近 1.0（内腔 = bolus 完整填充空间）。",
-         f"当前值 {Ratio:.4f}，偏差超出 ±5%。\n"
-         "  → 重新生成模具；若比值持续偏大，检查 Bolus_Expanded 段是否意外保留在场景中。"),
         ("最小壳厚", shell_thick_ok,
          f"模具最薄处壁厚，需 ≥{MIN_PRINT_THICKNESS_MM:.0f}mm 保证 3D 打印强度。",
-         f"当前最薄处 {min_shell_mm:.2f}mm，CT 体素 {ct_max_spacing:.2f}mm 导致 Margin 膨胀精度不足。\n"
-         f"  → 在第 6 步将壳厚设定值调高至 {shell_mm + 1.0:.0f}mm（实际膨胀后约 {min_shell_mm + 1.0:.1f}mm）。"),
+         f"当前最薄处 {min_shell_mm:.2f}mm。\n"
+         f"  → 在第 6 步将壳厚设定值调高至 {max(shell_mm + 1.0, MIN_PRINT_THICKNESS_MM + 0.5):.0f}mm 后重新生成模具。"),
         ("非流形边", geom_ok,
          "封闭壳网格是否为封闭流形（设计中的 sprue/vent/开顶切口已用 Closed 排除）。",
          f"封闭壳发现 {n_bad_closed} 条非流形/开放边，几何生成阶段已出现破坏。\n"
          "  → 重新生成模具；若问题持续，在 Slicer Surface Toolbox 中执行 Clean / Fill Holes。"),
     ]
 
+    _key_map = {
+        "MHD": "MHD_mm", "HD95": "HD95_mm",
+        "最小壳厚": "min_shell_thickness_mm", "非流形边": "non_manifold_edges",
+    }
+    fix_hints = {}
     to_log("info", "── 指标说明 ──")
     for name, passed, description, fix in METRIC_HELP:
         to_log("info", f"[{name}] {description}")
         if not passed:
             for fix_line in fix.split("\n"):
                 to_log("warning", f"  ✗ {fix_line.strip()}")
+            fix_hints[_key_map.get(name, name)] = " ".join(l.strip() for l in fix.split("\n") if l.strip())
 
     result_status = "PASS" if ok else "FAIL"
     to_log("success" if ok else "error", f"适形度评估: {result_status}")
@@ -1537,8 +1578,6 @@ def execute_validate(config):
         "status": result_status,
         "MHD_mm": round(MHD, 3),
         "HD95_mm": round(HD95, 3),
-        "Dice": round(Dice, 4),
-        "volume_ratio": round(Ratio, 4),
         "min_shell_thickness_mm": round(min_shell_mm, 2),
         "non_manifold_edges": int(n_bad_closed),
         "silicone_cm3": silicone_cm3,
@@ -1549,12 +1588,10 @@ def execute_validate(config):
         "thresholds": {
             "MHD_mm": round(mhd_thr, 3),
             "HD95_mm": round(hd95_thr, 3),
-            "Dice": 0.95,
-            "volume_ratio_min": 0.95,
-            "volume_ratio_max": 1.05,
             "min_shell_thickness_mm": MIN_PRINT_THICKNESS_MM,
             "printer_limit_mm": PRINTER_LIMIT_MM,
         },
+        "fix_hints": fix_hints,
     }]
 
 

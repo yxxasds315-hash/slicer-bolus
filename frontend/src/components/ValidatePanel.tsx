@@ -31,22 +31,10 @@ const METRICS: MetricSpec[] = [
     target: (t) => `< ${t.HD95_mm.toFixed(2)}`,
   },
   {
-    key: 'Dice', label: 'Dice', unit: '',
-    fmt: (v) => v.toFixed(4),
-    ok: (v, t) => v > t.Dice,
-    target: (t) => `> ${t.Dice.toFixed(2)}`,
-  },
-  {
-    key: 'volume_ratio', label: '体积比', unit: '',
-    fmt: (v) => v.toFixed(4),
-    ok: (v, t) => v > t.volume_ratio_min && v < t.volume_ratio_max,
-    target: (t) => `${t.volume_ratio_min.toFixed(2)}~${t.volume_ratio_max.toFixed(2)}`,
-  },
-  {
-    key: 'mold_skin_overlap_cm3', label: 'mold∩skin', unit: 'cm³',
-    fmt: (v) => v.toFixed(3),
-    ok: (v, t) => v < t.overlap_cm3,
-    target: (t) => `< ${t.overlap_cm3.toFixed(2)}`,
+    key: 'min_shell_thickness_mm', label: '最小壳厚', unit: 'mm',
+    fmt: (v) => v.toFixed(2),
+    ok: (v, t) => v >= t.min_shell_thickness_mm,
+    target: (t) => `≥ ${t.min_shell_thickness_mm.toFixed(0)}`,
   },
   {
     key: 'non_manifold_edges', label: '非流形边', unit: '',
@@ -127,26 +115,26 @@ export function ValidatePanel({ config, onValidate, validateStatus, validateResu
             </table>
           </div>
 
-          <p className="text-xs text-medical-500 px-1">
-            CT 最大体素 <span className="font-mono text-medical-400">{validateResult.ct_voxel_max_mm.toFixed(2)} mm</span>
-            ，MHD/HD95 阈值已据此自适应
-          </p>
-
-          {validateResult.mold_skin_overlap_centroid_ras && (
-            <div className="bg-danger/15 border border-danger/40 rounded-md px-3 py-2 text-xs space-y-1">
-              <p className="text-danger font-medium">⚠ 穿模警告</p>
-              <p className="text-danger/80">
-                质心 RAS:{' '}
-                <span className="font-mono">
-                  ({validateResult.mold_skin_overlap_centroid_ras.map((v) => v.toFixed(1)).join(', ')})
-                </span>{' '}
-                mm
-              </p>
-              <p className="text-medical-400">
-                Slicer 3D 视图已自动放置红色 Fiducial「Bolus_穿模警告」，可点击跳转该位置
-              </p>
+          {!allPass && Object.keys(validateResult.fix_hints ?? {}).length > 0 && (
+            <div className="bg-warning/10 border border-warning/30 rounded-md px-3 py-2.5 space-y-2">
+              <p className="text-xs font-medium text-warning">修改建议</p>
+              {METRICS.filter(({ key, ok }) => !ok(validateResult[key] as number, validateResult.thresholds)).map(({ key, label }) => {
+                const hint = validateResult.fix_hints?.[key];
+                if (!hint) return null;
+                return (
+                  <div key={key} className="text-xs text-warning/80 leading-relaxed">
+                    <span className="font-medium text-warning">[{label}]</span> {hint}
+                  </div>
+                );
+              })}
             </div>
           )}
+
+          <div className="bg-medical-900/50 rounded-md px-3 py-2 text-xs space-y-1 text-medical-400">
+            <p>硅胶用量: <span className="font-mono text-accent-300">{validateResult.silicone_cm3.toFixed(1)} cm³</span> ≈ <span className="font-mono text-accent-300">{validateResult.silicone_g.toFixed(1)} g</span></p>
+            <p>模具尺寸: <span className="font-mono text-accent-300">{validateResult.mold_dims_mm.map((v) => v.toFixed(0)).join(' × ')} mm</span> {validateResult.fits_printer ? <span className="text-success">✓</span> : <span className="text-danger">⚠ 超出 {validateResult.thresholds.printer_limit_mm.toFixed(0)}mm 构建体积</span>}</p>
+            <p>CT 最大体素 <span className="font-mono text-medical-400">{validateResult.ct_voxel_max_mm.toFixed(2)} mm</span>，MHD/HD95 阈值已据此自适应</p>
+          </div>
 
           <button onClick={onValidate} className="w-full py-2 px-4 bg-medical-600 text-medical-300 rounded-lg text-sm hover:bg-medical-500 transition-colors">
             🔄 重新评估

@@ -41,14 +41,34 @@ export function MoldGenerator({ config, onChange, onGenerate, moldStatus, moldEr
           <p className="text-xs text-medical-500 mt-1.5">
             {config.mold_type === 'closed'
               ? '硬质打印 + 注料口灌胶，需要 TPU 撕开或切开取出 bolus'
-              : '自动检测 bolus 的 outward 方向开口，适配头顶/胸壁/侧脸等任意临床位置。直接倒入硅胶，固化后顺势拔出'}
+              : '指定解剖方向开口，直接倒入硅胶，固化后顺势拔出'}
           </p>
         </div>
 
+        {config.mold_type === 'open_top' && (
+          <div className="border-t border-medical-700 pt-4">
+            <div className="text-xs text-medical-400 mb-2">开口方向</div>
+            <div className="grid grid-cols-4 gap-1.5">
+              {(['S', 'I', 'A', 'P', 'L', 'R', 'auto'] as const).map((dir) => (
+                <button
+                  key={dir}
+                  onClick={() => onChange({ opening_dir: dir })}
+                  className={`py-1.5 rounded text-xs font-mono transition-colors ${config.opening_dir === dir ? 'bg-accent-400 text-medical-900 font-semibold' : 'bg-medical-700 text-medical-300 hover:bg-medical-600'}`}
+                >
+                  {dir === 'auto' ? '自动' : dir}
+                </button>
+              ))}
+            </div>
+            <p className="text-xs text-medical-500 mt-1.5">
+              S=头顶 I=足底 A=前 P=后 L=左 R=右 · 自动=几何推断
+            </p>
+          </div>
+        )}
+
         <div className="border-t border-medical-700 pt-4">
           <div className="flex justify-between mb-1.5"><label className="text-sm text-medical-400">壳体壁厚</label><span className="text-sm font-mono text-accent-300">{config.mold_shell_thickness_mm} mm</span></div>
-          <input type="range" min={4} max={10} step={0.5} value={config.mold_shell_thickness_mm} onChange={(e) => onChange({ mold_shell_thickness_mm: Number(e.target.value) })} className="slider-medical" />
-          <p className="text-xs text-medical-500 mt-0.5">最小 4mm（Z 向 ≥ 1 体素）</p>
+          <input type="range" min={3} max={10} step={0.5} value={config.mold_shell_thickness_mm} onChange={(e) => onChange({ mold_shell_thickness_mm: Number(e.target.value) })} className="slider-medical" />
+          <p className="text-xs text-medical-500 mt-0.5">最小 3mm（≥ 3mm 保证打印强度）</p>
         </div>
 
         {config.mold_type === 'closed' && (

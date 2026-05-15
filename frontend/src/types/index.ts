@@ -14,6 +14,7 @@ export interface PipelineConfig {
   mold_vent_radius_mm: number;
   mold_with_sprue: boolean;
   mold_type: 'closed' | 'open_top';
+  opening_dir: 'S' | 'I' | 'A' | 'P' | 'L' | 'R' | 'auto';
   mold_base_plate: boolean;
 }
 
@@ -39,23 +40,23 @@ export type ValidateStatus = 'idle' | 'running' | 'completed' | 'error';
 export interface ValidateThresholds {
   MHD_mm: number;
   HD95_mm: number;
-  Dice: number;
-  volume_ratio_min: number;
-  volume_ratio_max: number;
-  overlap_cm3: number;
+  min_shell_thickness_mm: number;
+  printer_limit_mm: number;
 }
 
 export interface ValidateResult {
   status: 'PASS' | 'FAIL';
   MHD_mm: number;
   HD95_mm: number;
-  Dice: number;
-  volume_ratio: number;
-  mold_skin_overlap_cm3: number;
-  mold_skin_overlap_centroid_ras: [number, number, number] | null;
+  min_shell_thickness_mm: number;
   non_manifold_edges: number;
+  silicone_cm3: number;
+  silicone_g: number;
+  mold_dims_mm: [number, number, number];
+  fits_printer: boolean;
   ct_voxel_max_mm: number;
   thresholds: ValidateThresholds;
+  fix_hints: Partial<Record<string, string>>;
 }
 
 export interface LogEntry {

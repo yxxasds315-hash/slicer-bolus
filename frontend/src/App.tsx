@@ -25,6 +25,7 @@ const defaultConfig: PipelineConfig = {
   mold_vent_radius_mm: 1.0,
   mold_with_sprue: true,
   mold_type: 'closed',
+  opening_dir: 'S',
   mold_base_plate: false,
 };
 
