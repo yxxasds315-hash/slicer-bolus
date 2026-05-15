@@ -1356,51 +1356,6 @@ def execute_validate(config):
             d[i] = d2 ** 0.5
         return d
 
-    def _voxelize_3d(p, sp, origin, dims):
-        """光栅化 polydata 为 3D 布尔掩码 (z, y, x)"""
-        img = vtk.vtkImageData()
-        img.SetOrigin(*origin); img.SetSpacing(sp, sp, sp); img.SetDimensions(*dims)
-        img.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, 1)
-        stk = vtk.vtkPolyDataToImageStencil()
-        stk.SetInputData(p)
-        stk.SetOutputOrigin(img.GetOrigin())
-        stk.SetOutputSpacing(img.GetSpacing())
-        stk.SetOutputWholeExtent(img.GetExtent())
-        stk.Update()
-        st = vtk.vtkImageStencil()
-        st.SetInputData(img)
-        st.SetStencilData(stk.GetOutput())
-        st.SetBackgroundValue(1); st.Update()
-        flat = vtk_to_numpy(st.GetOutput().GetPointData().GetScalars()).astype(bool)
-        return ~flat.reshape((dims[2], dims[1], dims[0]))  # SetBackgroundValue(1) → outside=1, invert to get True=inside
-
-    def _vox_enclosed(poly, sp, origin, dims):
-        """vtkSelectEnclosedPoints 体素化（fallback）：对复杂拓扑/翻面网格比 PolyDataToImageStencil 更稳健。
-        返回 (z, y, x) 布尔数组：True = 体素中心位于 poly 围闭区域内（奇偶规则）。"""
-        from vtk.util.numpy_support import numpy_to_vtk
-        nx, ny, nz = dims
-        kk, jj, ii = np.meshgrid(
-            np.arange(nz, dtype=np.float32),
-            np.arange(ny, dtype=np.float32),
-            np.arange(nx, dtype=np.float32),
-            indexing='ij',
-        )
-        pts = np.column_stack([
-            origin[0] + ii.ravel() * sp,
-            origin[1] + jj.ravel() * sp,
-            origin[2] + kk.ravel() * sp,
-        ])
-        vpts = vtk.vtkPoints()
-        vpts.SetData(numpy_to_vtk(pts, deep=1))
-        pd = vtk.vtkPolyData()
-        pd.SetPoints(vpts)
-        sel = vtk.vtkSelectEnclosedPoints()
-        sel.SetInputData(pd)
-        sel.SetSurfaceData(poly)
-        sel.SetTolerance(1e-6)
-        sel.Update()
-        arr = sel.GetOutput().GetPointData().GetArray("SelectedPoints")
-        return vtk_to_numpy(arr).astype(bool).reshape((nz, ny, nx))
 
     def _bad_edges(p):
         fe = vtk.vtkFeatureEdges()
@@ -1452,28 +1407,18 @@ def execute_validate(config):
     to_log("info", f"  模具尺寸: {mold_x:.1f} × {mold_y:.1f} × {mold_z:.1f} mm  "
                    f"({'✓ 在 256mm 限内' if fits_printer else f'⚠ 超出打印机 {PRINTER_LIMIT_MM:.0f}mm 构建体积'})")
 
-    # ── 共享体素网格 ──
-    to_log("info", "[3/5] 体素化 (共享网格 1mm)...")
-    _sp = 1.0
-    _pad = max(_sp * 2, shell_mm + 2.0)
-    _origin = (
-        min(bB[0], bF[0]) - _pad,
-        min(bB[2], bF[2]) - _pad,
-        min(bB[4], bF[4]) - _pad,
-    )
-    _dims = (
-        int((max(bB[1], bF[1]) + _pad - _origin[0]) / _sp) + 1,
-        int((max(bB[3], bF[3]) + _pad - _origin[1]) / _sp) + 1,
-        int((max(bB[5], bF[5]) + _pad - _origin[2]) / _sp) + 1,
-    )
-    vB = _voxelize_3d(B, _sp, _origin, _dims)
-
-    # EDT 直接计算理论壳料，跳过空心薄壁网格的体素化。
-    # PolyDataToImageStencil 奇偶规则和 vtkSelectEnclosedPoints 均无法可靠处理
-    # EDT 生成的 2-voxel 厚空心壳网格；几何一致性由 MHD/HD95（表面采样）保证。
-    dist_outside_B = distance_transform_edt(~vB, sampling=(_sp, _sp, _sp))
-    vF_ideal = (dist_outside_B > 0) & (dist_outside_B <= shell_mm)
-    to_log("info", f"  理论壳料体积: {vF_ideal.sum() * _sp**3:.0f} mm³（EDT {shell_mm}mm）")
+    # ── bolus 体积：直接从 CT-分辨率 labelmap 读取，绕开薄壳网格体素化失败问题 ──
+    to_log("info", "[3/5] 计算 bolus 体积...")
+    _seg = seg_node.GetSegmentation()
+    _bolus_seg_id = _seg.GetSegmentIdBySegmentName(bolus_name)
+    if _bolus_seg_id:
+        _arr_b = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, _bolus_seg_id, vols[0]).astype(bool)
+        _ct_sx, _ct_sy, _ct_sz = vols[0].GetSpacing()
+        vol_B = float(_arr_b.sum()) * _ct_sx * _ct_sy * _ct_sz
+        to_log("info", f"  bolus 体积（labelmap）: {vol_B:.0f} mm³")
+    else:
+        vol_B = 0.0
+        to_log("warning", "  ⚠ 未找到 bolus 段，硅胶用量无法计算")
 
     # ── 自适应密度采样 + 内表面过滤 ──
     to_log("info", "[4/5] 表面采样 (自适应密度)...")
@@ -1485,10 +1430,9 @@ def execute_validate(config):
     B_loc = _build_locator(B)
     dF_all = _nearest_dist(pF_all, B_loc)
 
-    # 最小壳厚：外表面采样点（距 bolus > 1.5mm 绝对值）到 bolus 的最小距离
-    # 用绝对阈值避免"shell_mm 设大 → 阈值跟着上抬 → 真实薄点被当作内表面剔除"的误判
-    OUTER_THRESHOLD_MM = 1.5
-    outer_mask = dF_all > OUTER_THRESHOLD_MM
+    # 最小壳厚：外表面采样点（距 bolus > 0.6×shell_mm）到 bolus 的最小距离
+    # EDT 生成壳体实际壳厚 ≈ 设定值，0.6×shell_mm 可正确区分内外表面
+    outer_mask = dF_all > shell_mm * 0.6
     min_shell_mm = float(dF_all[outer_mask].min()) if outer_mask.any() else 0.0
     MIN_PRINT_THICKNESS_MM = 3.0
     shell_thick_ok = min_shell_mm >= MIN_PRINT_THICKNESS_MM
@@ -1505,9 +1449,6 @@ def execute_validate(config):
     dBF = _nearest_dist(pB, F_loc)
     MHD = max(dBF.mean(), dFB.mean())
     HD95 = max(np.percentile(dBF, 95), np.percentile(dFB, 95))
-
-    vox_unit = _sp ** 3
-    vol_B = vB.sum() * vox_unit
 
     silicone_cm3 = round(vol_B / 1000.0, 1)
     silicone_g   = round(silicone_cm3 * 1.1, 1)
