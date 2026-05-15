@@ -1422,7 +1422,7 @@ def execute_validate(config):
 
     # ── 自适应密度采样 + 内表面过滤 ──
     to_log("info", "[4/5] 表面采样 (自适应密度)...")
-    target_spacing = _sp * 1.5
+    target_spacing = 1.5
     pB = _sample_poly(B, target_spacing)
     pF_all = _sample_poly(F, target_spacing)
 
