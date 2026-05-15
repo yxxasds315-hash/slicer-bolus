@@ -101,7 +101,7 @@ def execute_pipeline(config):
     to_log("info", f"  校验通过: {SEG['skin']} 段存在")
 
     # ── 自动边界检查: 确保 volume 有足够空间容纳全流程膨胀 ──
-    # 全流程最大外扩 = bolus Margin + 阴模 shell 膨胀
+    # 全流程最大外扩 = bolus 厚度（EDT）+ 阴模壳厚（EDT）
     _shell = d.get("mold_shell_thickness_mm", 4.0)
     _required_margin = d["thickness_mm"] + _shell + 3.0  # +3mm 光栅化安全余量
 
@@ -217,11 +217,22 @@ def execute_pipeline(config):
     bolus_arr = (edt > 0) & (edt <= BOLUS_THICKNESS)
     to_log("info", f"  Bolus 初始体积: {bolus_arr.sum()} 体素")
 
-    # 应用 ROI cutter 掩膜
+    # HU 空气过滤：剔除 Scissors 截面侧裙和床板残留
+    # cut edge 旁的"伪 bolus"落在体内组织（HU > -500），真实 bolus 落在空气（HU ≈ -1000）
+    ct_arr = slicer.util.arrayFromVolume(vol)
+    AIR_HU_MAX = -500
+    is_air = ct_arr < AIR_HU_MAX
+    n_before_air = int(bolus_arr.sum())
+    bolus_arr &= is_air
+    n_after_air = int(bolus_arr.sum())
+    to_log("info", f"  HU 空气过滤 (HU<{AIR_HU_MAX}): {n_before_air} → {n_after_air} 体素 "
+                   f"(剔除 {n_before_air - n_after_air} 个非空气位置)")
+
+    # 应用 ROI cutter 掩膜（bbox 兜底，HU 过滤已是主防线）
     cutter_arr = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, cutter_id, vol).astype(bool)
     seg.RemoveSegment(cutter_id)
     bolus_arr &= cutter_arr
-    to_log("info", f"  裁切后体积: {bolus_arr.sum()} 体素")
+    to_log("info", f"  ROI 裁切后体积: {bolus_arr.sum()} 体素")
 
     # 保留最大连通体（替代 Islands KEEP_LARGEST_ISLAND）
     labeled, n_components = _scipy_label(bolus_arr)
@@ -688,46 +699,6 @@ def _poly_boolean(poly_a, poly_b, operation):
     return result
 
 
-def _apply_margin_to_segment(seg_node, segment_name, margin_mm, new_name):
-    seg = seg_node.GetSegmentation()
-    # 入口防御性清理：上一次失败可能遗留同名段（陈旧几何），先删除再新建避免污染本次结果
-    old_target = seg.GetSegmentIdBySegmentName(new_name)
-    if old_target:
-        seg.RemoveSegment(old_target)
-    src_id = seg.GetSegmentIdBySegmentName(segment_name)
-    new_id = seg.AddEmptySegment(new_name, new_name)
-    ref_volume = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
-    if ref_volume is None:
-        raise RuntimeError("场景中无体积数据，无法执行 Margin 膨胀。请先完成 DICOM 加载和预览分割。")
-    seg_editor_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentEditorNode")
-    seg_editor_node.SetOverwriteMode(slicer.vtkMRMLSegmentEditorNode.OverwriteNone)
-    seg_editor_widget = slicer.qMRMLSegmentEditorWidget()
-    seg_editor_widget.setMRMLScene(slicer.mrmlScene)
-    seg_editor_widget.setMRMLSegmentEditorNode(seg_editor_node)
-    seg_editor_widget.setSegmentationNode(seg_node)
-    seg_editor_widget.setSourceVolumeNode(ref_volume)
-    seg_editor_node.SetSelectedSegmentID(new_id)
-    # 确保 binary labelmap 为主表示，COPY 依赖它
-    seg.CreateRepresentation(slicer.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName())
-    try:
-        # 用 Logical operators COPY 复制源段（避免 seg.CopySegment 兼容性问题）
-        effect = _safe_get_effect(seg_editor_widget, "Logical operators")
-        effect.setParameter("Operation", "COPY")
-        effect.setParameter("ModifierSegmentID", src_id)
-        effect.self().onApply()
-        to_log("info", f"  [复制] {segment_name} → {new_name}")
-
-        effect = _safe_get_effect(seg_editor_widget, "Margin")
-        effect.setParameter("MarginSizeMm", str(margin_mm))
-        effect.self().onApply()
-        to_log("info", f"  [Margin +{margin_mm}mm] 完成")
-    finally:
-        seg_editor_widget.setActiveEffectByName("")
-        seg_editor_widget.setMRMLScene(None)
-        slicer.mrmlScene.RemoveNode(seg_editor_node)
-    return new_id
-
-
 def _make_cylinder_poly(cx, cy, cz, radius, height, resolution=32):
     """生成沿 Z 轴的圆柱，中心位于 (cx, cy, cz)。
 
@@ -1059,10 +1030,8 @@ def _add_sprue_and_vents(female_poly, sprue_radius_mm, vent_radius_mm, shell_mm,
 
     几何保证：
       - 圆柱深度 h = shell_mm + thickness_mm/2 + 2：圆柱底落在理论内腔中点
-        cylinder_bottom = z_skin + thickness/2 + (actual_shell - shell_mm)
-        对 Margin 体素化精度误差 |δ| < thickness/2 都能稳健落在内腔内
-        （应对 PROJECT_STATUS 记录的"4mm shell 在 3mm 切片上膨胀成 3mm"欠冲场景，
-        以及反向的过冲场景）。同时距底板 ≥ thickness/2 ≥ 2mm，决不贯穿。
+        EDT 生成的壳厚 ≈ 设定值，无量化误差；+2mm 顶部余量保证打穿外表面，
+        距底板 ≥ thickness/2 ≥ 2mm，决不贯穿 bolus 内腔底面。
       - sprue 与 vent 统一以顶面点云重心 (top_cx, top_cy) 为参考，避免对不对称 bolus 用
         bounding box 中心导致圆柱不落在顶面上。
       - 落点验证：与最近顶面点距离 > 半径+2mm 则视为落在空洞中（如 U 形 bolus），拒绝处理。
@@ -1087,7 +1056,7 @@ def _add_sprue_and_vents(female_poly, sprue_radius_mm, vent_radius_mm, shell_mm,
     top_x_span = float(top_pts[:, 0].max() - top_pts[:, 0].min())
     top_y_span = float(top_pts[:, 1].max() - top_pts[:, 1].min())
 
-    # 内腔跨度 ≈ 外顶面跨度 - 2×shell（Margin 向两侧各膨胀 shell_mm）
+    # 内腔跨度 ≈ 外顶面跨度 - 2×shell（EDT 在两侧各膨胀 shell_mm）
     inner_x_span = max(top_x_span - 2.0 * shell_mm, 0.0)
     inner_y_span = max(top_y_span - 2.0 * shell_mm, 0.0)
     if inner_x_span >= inner_y_span:
@@ -1096,8 +1065,8 @@ def _add_sprue_and_vents(female_poly, sprue_radius_mm, vent_radius_mm, shell_mm,
         long_span, vent_dx, vent_dy, axis_name = inner_y_span, 0, 1, "Y"
 
     # 圆柱深度：从外顶面上方 2mm 落到理论内腔中点
-    # cylinder_bottom = b[5] + 2 - h = z_skin + thickness/2 + (actual_shell - shell_mm)
-    # 对 |Margin 精度误差| < thickness/2 保持在内腔内；距底板 ≥ thickness/2，绝不贯穿
+    # cylinder_bottom = b[5] + 2 - h = z_skin + thickness/2
+    # EDT 生成壳厚 = shell_mm（精确），距底板 ≥ thickness/2，绝不贯穿
     h_cyl = shell_mm + thickness_mm / 2.0 + 2.0
     cz = b[5] + 2.0 - h_cyl / 2.0
 

@@ -50,7 +50,7 @@ export function ValidatePanel({ config, onValidate, validateStatus, validateResu
   return (
     <div className="space-y-5">
       <p className="text-medical-500 text-sm">
-        评估阴模（Mold_Female_Conformal）与补偿器的适形度：表面距离、体素重叠、体积比、模具与皮肤穿模检测、3D 打印拓扑健康。阈值随 CT 体素分辨率自适应。
+        评估阴模（Mold_Female_Conformal）与补偿器的适形度：表面距离（MHD/HD95）、最小壳厚、网格拓扑健康。MHD/HD95 阈值随 CT 体素分辨率自适应。
       </p>
 
       <div className="bg-medical-900/50 rounded-lg p-4 border border-medical-700 space-y-3">
