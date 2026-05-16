@@ -88,11 +88,22 @@ export function SegmentationPanel({ config, onChange, onPreview, onScissors, onS
 
       {/* 二次封口完成 */}
       {previewStatus === 'sealed' && (
-        <div className="bg-accent-400/10 border border-accent-400/30 rounded-lg p-4 space-y-3">
+        <div className="bg-accent-400/10 border border-accent-400/30 rounded-lg p-4 space-y-4">
           <div className="flex items-center gap-2"><span className="text-lg">👂</span><span className="text-sm text-accent-300 font-medium">二次封口完成</span></div>
           <p className="text-xs text-medical-400">
-            大核 {config.seal_kernel_1_mm}mm 封耳道 + 中核 {config.seal_kernel_2_mm}mm 补鼻孔已完成。请在 Slicer 中检查效果，不满意可调整参数后再次执行。
+            请在 Slicer 中检查效果，不满意可调整参数后再次执行。
           </p>
+          <div className="bg-medical-900/50 rounded-lg p-3 space-y-3 border border-medical-700">
+            <p className="text-xs text-medical-400 font-medium">🔧 调整参数后重新封口</p>
+            <div>
+              <div className="flex justify-between mb-1"><label className="text-xs text-medical-400">耳道大核</label><span className="text-xs font-mono text-accent-300">{config.seal_kernel_1_mm} mm</span></div>
+              <input type="range" min={8} max={20} step={0.5} value={config.seal_kernel_1_mm} onChange={(e) => onChange({ seal_kernel_1_mm: Number(e.target.value) })} className="slider-medical" />
+            </div>
+            <div>
+              <div className="flex justify-between mb-1"><label className="text-xs text-medical-400">鼻孔中核</label><span className="text-xs font-mono text-accent-300">{config.seal_kernel_2_mm} mm</span></div>
+              <input type="range" min={4} max={12} step={0.5} value={config.seal_kernel_2_mm} onChange={(e) => onChange({ seal_kernel_2_mm: Number(e.target.value) })} className="slider-medical" />
+            </div>
+          </div>
           <div className="flex gap-3">
             <button onClick={onFinalize} className="flex-1 py-2.5 bg-accent-400 text-medical-900 rounded-lg text-sm font-bold hover:bg-accent-300 transition-colors">完成平滑，继续</button>
             <button onClick={onSeal} className="flex-1 py-2 px-4 bg-medical-600 text-medical-300 rounded-lg text-sm hover:bg-medical-500 transition-colors">🔄 再次封口</button>

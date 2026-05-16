@@ -379,6 +379,11 @@ def execute_activate_scissors(config):
 def execute_finalize_preview(config):
     import slicer
 
+    try:
+        slicer.modules.segmenteditor.widgetRepresentation().self().editor.setActiveEffectByName("")
+    except Exception:
+        pass
+
     d = config
     to_log("info", "========== 完成分割: 去杂讯 + 平滑 ==========")
 
@@ -435,6 +440,11 @@ def execute_finalize_preview(config):
 def execute_solidify(config):
     """实心化: 形态学闭合密封气道 → 外部空气掩膜 → 保留最大岛 → 反转填充内部空腔."""
     import slicer
+
+    try:
+        slicer.modules.segmenteditor.widgetRepresentation().self().editor.setActiveEffectByName("")
+    except Exception:
+        pass
 
     to_log("info", "========== 实心化: 填充内部空腔 ==========")
 

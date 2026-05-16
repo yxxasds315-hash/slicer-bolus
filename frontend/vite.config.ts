@@ -5,7 +5,7 @@ import { spawn } from 'child_process'
 import path from 'path'
 
 function slicerLauncherPlugin() {
-  const launchScript = path.resolve(__dirname, '../launch_slicer.sh')
+  const launchScript = path.resolve(__dirname, '../scripts/launch_slicer.sh')
 
   return {
     name: 'slicer-launcher',
